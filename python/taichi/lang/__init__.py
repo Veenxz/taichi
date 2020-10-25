@@ -8,6 +8,7 @@ import functools
 import os
 
 core = taichi_lang_core
+
 runtime = get_runtime()
 
 i = indices(0)
@@ -15,6 +16,11 @@ j = indices(1)
 k = indices(2)
 l = indices(3)
 ij = indices(0, 1)
+ji = indices(1, 0)
+jk = indices(1, 2)
+kj = indices(2, 1)
+ik = indices(0, 2)
+ki = indices(2, 0)
 ijk = indices(0, 1, 2)
 ijkl = indices(0, 1, 2, 3)
 
@@ -33,23 +39,25 @@ arm64 = core.arm64
 cuda = core.cuda
 metal = core.metal
 opengl = core.opengl
+cc = core.cc
 gpu = [cuda, metal, opengl]
 cpu = core.host_arch()
-profiler_print = lambda: core.get_current_program().profiler_print()
-profiler_clear = lambda: core.get_current_program().profiler_clear()
-profiler_start = lambda n: core.get_current_program().profiler_start(n)
-profiler_stop = lambda: core.get_current_program().profiler_stop()
+kernel_profiler_print = lambda: get_runtime().prog.kernel_profiler_print()
+kernel_profiler_clear = lambda: get_runtime().prog.kernel_profiler_clear()
+kernel_profiler_total_time = lambda: get_runtime(
+).prog.kernel_profiler_total_time()
+
+# Unstable API
+type_factory_ = core.get_type_factory_instance()
 
 
-class _Extension(object):
-    def __init__(self):
-        self.sparse = core.sparse
-        self.data64 = core.data64
-        self.adstack = core.adstack
+def memory_profiler_print():
+    get_runtime().materialize()
+    get_runtime().prog.print_memory_profiler_info()
 
 
-extension = _Extension()
-is_supported = core.is_supported
+extension = core.Extension
+is_extension_supported = core.is_extension_supported
 
 
 def reset():
@@ -59,121 +67,177 @@ def reset():
     runtime = get_runtime()
 
 
+class _EnvironmentConfigurator:
+    def __init__(self, kwargs, cfg):
+        self.cfg = cfg
+        self.kwargs = kwargs
+        self.keys = []
+
+    def add(self, key, cast=None):
+        cast = cast or self.bool_int
+
+        self.keys.append(key)
+
+        # TI_ASYNC=   : no effect
+        # TI_ASYNC=0  : False
+        # TI_ASYNC=1  : True
+        name = 'TI_' + key.upper()
+        value = os.environ.get(name, '')
+        if len(value):
+            self[key] = cast(value)
+            if key in self.kwargs:
+                core.warn(
+                    f'ti.init argument "{key}" overridden by environment variable {name}={value}'
+                )
+                del self.kwargs[key]  # mark as recognized
+        elif key in self.kwargs:
+            self[key] = self.kwargs[key]
+            del self.kwargs[key]  # mark as recognized
+
+    def __getitem__(self, key):
+        return getattr(self.cfg, key)
+
+    def __setitem__(self, key, value):
+        setattr(self.cfg, key, value)
+
+    @staticmethod
+    def bool_int(x):
+        return bool(int(x))
+
+
+class _SpecialConfig:
+    # like CompileConfig in C++, this is the configurations that belong to other submodules
+    def __init__(self):
+        self.print_preprocessed = False
+        self.log_level = 'info'
+        self.gdb_trigger = False
+        self.excepthook = False
+
+
 def init(arch=None,
          default_fp=None,
          default_ip=None,
-         print_preprocessed=None,
-         debug=None,
+         _test_mode=False,
          **kwargs):
+    import taichi as ti
+
     # Make a deepcopy in case these args reference to items from ti.cfg, which are
     # actually references. If no copy is made and the args are indeed references,
     # ti.reset() could override the args to their default values.
     default_fp = _deepcopy(default_fp)
     default_ip = _deepcopy(default_ip)
     kwargs = _deepcopy(kwargs)
-    import taichi as ti
     ti.reset()
 
-    if default_fp is None:  # won't override
-        dfl_fp = os.environ.get("TI_DEFAULT_FP")
-        if dfl_fp == 32:
-            default_fp = core.DataType.f32
-        elif dfl_fp == 64:
-            default_fp = core.DataType.f64
-        elif dfl_fp is not None:
-            raise ValueError(
-                f'Unrecognized TI_DEFAULT_FP: {dfl_fp}, should be 32 or 64')
-    if default_ip is None:
-        dfl_ip = os.environ.get("TI_DEFAULT_IP")
-        if dfl_ip == 32:
-            default_ip = core.DataType.i32
-        elif dfl_ip == 64:
-            default_ip = core.DataType.i64
-        elif dfl_ip is not None:
-            raise ValueError(
-                f'Unrecognized TI_DEFAULT_IP: {dfl_ip}, should be 32 or 64')
+    spec_cfg = _SpecialConfig()
+    env_comp = _EnvironmentConfigurator(kwargs, ti.cfg)
+    env_spec = _EnvironmentConfigurator(kwargs, spec_cfg)
 
-    if print_preprocessed is None:  # won't override
-        print_preprocessed = os.environ.get("TI_PRINT_PREPROCESSED")
-        if print_preprocessed is not None:
-            print_preprocessed = bool(int(print_preprocessed))
+    # configure default_fp/ip:
+    # TODO: move these stuff to _SpecialConfig too:
+    env_default_fp = os.environ.get("TI_DEFAULT_FP")
+    if env_default_fp:
+        if default_fp is not None:
+            core.warn(
+                f'ti.init argument "default_fp" overridden by environment variable TI_DEFAULT_FP={env_default_fp}'
+            )
+        if env_default_fp == '32':
+            default_fp = f32
+        elif env_default_fp == '64':
+            default_fp = f64
+        elif env_default_fp is not None:
+            raise ValueError(
+                f'Invalid TI_DEFAULT_FP={env_default_fp}, should be 32 or 64')
+
+    env_default_ip = os.environ.get("TI_DEFAULT_IP")
+    if env_default_ip:
+        if default_ip is not None:
+            core.warn(
+                f'ti.init argument "default_ip" overridden by environment variable TI_DEFAULT_IP={env_default_ip}'
+            )
+        if env_default_ip == '32':
+            default_ip = i32
+        elif env_default_ip == '64':
+            default_ip = i64
+        elif env_default_ip is not None:
+            raise ValueError(
+                f'Invalid TI_DEFAULT_IP={env_default_ip}, should be 32 or 64')
 
     if default_fp is not None:
         ti.get_runtime().set_default_fp(default_fp)
     if default_ip is not None:
         ti.get_runtime().set_default_ip(default_ip)
-    if print_preprocessed is not None:
-        ti.get_runtime().print_preprocessed = print_preprocessed
 
-    if debug is None:
-        debug = bool(int(os.environ.get('TI_DEBUG', '0')))
-    if debug:
-        ti.set_logging_level(ti.TRACE)
-    ti.cfg.debug = debug
+    # submodule configurations (spec_cfg):
+    env_spec.add('print_preprocessed')
+    env_spec.add('log_level', str)
+    env_spec.add('gdb_trigger')
+    env_spec.add('excepthook')
 
-    unified_memory = os.environ.get('TI_USE_UNIFIED_MEMORY', '')
-    if unified_memory != '':
-        use_unified_memory = bool(int(unified_memory))
-        ti.cfg.use_unified_memory = use_unified_memory
-        if not use_unified_memory:
-            ti.trace(
-                'Unified memory disabled (env TI_USE_UNIFIED_MEMORY=0). This is experimental.'
-            )
+    # compiler configurations (ti.cfg):
+    for key in dir(ti.cfg):
+        if key in ['arch', 'default_fp', 'default_ip']:
+            continue
+        cast = type(getattr(ti.cfg, key))
+        if cast is bool:
+            cast = None
+        env_comp.add(key, cast)
 
-    for k, v in kwargs.items():
-        setattr(ti.cfg, k, v)
+    unexpected_keys = kwargs.keys()
+    if len(unexpected_keys):
+        raise KeyError(
+            f'Unrecognized keyword argument(s) for ti.init: {", ".join(unexpected_keys)}'
+        )
 
-    def bool_int(x):
-        return bool(int(x))
+    # dispatch configurations that are not in ti.cfg:
+    if not _test_mode:
+        ti.set_gdb_trigger(spec_cfg.gdb_trigger)
+        ti.get_runtime().print_preprocessed = spec_cfg.print_preprocessed
+        ti.set_logging_level(spec_cfg.log_level.lower())
+        if spec_cfg.excepthook:
+            # TODO(#1405): add a way to restore old excepthook
+            ti.enable_excepthook()
 
-    def environ_config(key, cast=bool_int):
-        name = 'TI_' + key.upper()
-        value = os.environ.get(name, '')
-        if len(value):
-            setattr(ti.cfg, key, cast(value))
-
-        # TI_ASYNC=   : not work
-        # TI_ASYNC=0  : False
-        # TI_ASYNC=1  : True
-
-    # does override
-    environ_config("print_ir")
-    environ_config("verbose")
-    environ_config("fast_math")
-    environ_config("async")
-    environ_config("print_benchmark_stat")
-    environ_config("device_memory_fraction", float)
-    environ_config("device_memory_GB", float)
-
-    # Q: Why not environ_config("gdb_trigger")?
-    # A: We don't have ti.cfg.gdb_trigger yet.
-    # Discussion: https://github.com/taichi-dev/taichi/pull/879
-    gdb_trigger = os.environ.get('TI_GDB_TRIGGER', '')
-    if len(gdb_trigger):
-        ti.set_gdb_trigger(bool(int(gdb_trigger)))
-
-    # Q: Why not environ_config("arch", ti.core.arch_from_name)?
-    # A: We need adaptive_arch_select for all.
-    env_arch = os.environ.get("TI_ARCH")
+    # select arch (backend):
+    env_arch = os.environ.get('TI_ARCH')
     if env_arch is not None:
-        print(f'Following TI_ARCH setting up for arch={env_arch}')
+        ti.info(f'Following TI_ARCH setting up for arch={env_arch}')
         arch = ti.core.arch_from_name(env_arch)
-
     ti.cfg.arch = adaptive_arch_select(arch)
+    print(f'[Taichi] Starting on arch={ti.core.arch_name(ti.cfg.arch)}')
 
-    log_level = os.environ.get("TI_LOG_LEVEL")
-    if log_level is not None:
-        ti.set_logging_level(log_level.lower())
+    if _test_mode:
+        return spec_cfg
 
+    # create a new program:
     ti.get_runtime().create_program()
 
 
-def cache_shared(v):
-    taichi_lang_core.cache(0, v.ptr)
+def no_activate(*args):
+    for v in args:
+        taichi_lang_core.no_activate(v.snode.ptr)
 
 
-def cache_l1(v):
-    taichi_lang_core.cache(1, v.ptr)
+def cache_shared(*args):
+    for a in args:
+        for v in a.get_field_members():
+            taichi_lang_core.cache(0, v.ptr)
+
+
+def cache_read_only(*args):
+    for a in args:
+        for v in a.get_field_members():
+            taichi_lang_core.cache(0, v.ptr)
+
+
+def assume_in_range(val, base, low, high):
+    return taichi_lang_core.expr_assume_in_range(
+        Expr(val).ptr,
+        Expr(base).ptr, low, high)
+
+
+def loop_unique(val):
+    return taichi_lang_core.expr_loop_unique(Expr(val).ptr)
 
 
 parallelize = core.parallelize
@@ -207,11 +271,19 @@ tr = deprecated('ti.tr(a)', 'a.trace()')(Matrix.trace)
 
 def Tape(loss, clear_gradients=True):
     get_runtime().materialize()
-    assert loss.snode().ptr.has_grad(), "gradient for loss not allocated"
+    if len(loss.shape) != 0:
+        raise RuntimeError(
+            'The loss of `Tape` must be a 0-D field, i.e. scalar')
+    if not loss.snode.ptr.has_grad():
+        raise RuntimeError(
+            'Gradients of loss are not allocated, please use ti.field(..., needs_grad=True)'
+            ' for all fields that are required by autodiff.')
     if clear_gradients:
         clear_all_gradients()
-    loss[None] = 0
-    loss.grad[None] = 1
+
+    from .meta import clear_loss
+    clear_loss(loss)
+
     return runtime.get_tape(loss)
 
 
@@ -242,48 +314,224 @@ schedules = [parallelize, vectorize, block_dim, cache]
 lang_core = core
 
 
-def static_print(*args, __p=print, **kwargs):
-    __p(*args, **kwargs)
-
-
 def benchmark(func, repeat=300, args=()):
     import taichi as ti
     import time
-    # The reason why we run 4 times is to warm up instruction/data caches.
-    # Discussion: https://github.com/taichi-dev/taichi/pull/1002#discussion_r426312136
-    for i in range(4):
+
+    def run_benchmark():
+        compile_time = time.time()
         func(*args)  # compile the kernel first
-    ti.sync()
-    t = time.time()
-    for n in range(repeat):
-        func(*args)
-    ti.get_runtime().sync()
-    elapsed = time.time() - t
-    avg = elapsed / repeat * 1000  # miliseconds
-    ti.stat_write(avg)
+        ti.sync()
+        compile_time = time.time() - compile_time
+        ti.stat_write('compilation_time', compile_time)
+        codegen_stat = ti.core.stat()
+        for line in codegen_stat.split('\n'):
+            try:
+                a, b = line.strip().split(':')
+            except:
+                continue
+            a = a.strip()
+            b = int(float(b))
+            if a == 'codegen_kernel_statements':
+                ti.stat_write('instructions', b)
+            if a == 'codegen_offloaded_tasks':
+                ti.stat_write('offloaded_tasks', b)
+            elif a == 'launched_tasks':
+                ti.stat_write('launched_tasks', b)
+
+        # Use 3 initial iterations to warm up
+        # instruction/data caches. Discussion:
+        # https://github.com/taichi-dev/taichi/pull/1002#discussion_r426312136
+        for i in range(3):
+            func(*args)
+            ti.sync()
+        ti.kernel_profiler_clear()
+        t = time.time()
+        for n in range(repeat):
+            func(*args)
+            ti.sync()
+        elapsed = time.time() - t
+        avg = elapsed / repeat
+        ti.stat_write('clock_time', avg)
+        device_time = ti.kernel_profiler_total_time()
+        ti.stat_write('device_time', device_time)
+
+    run_benchmark()
 
 
-def stat_write(avg):
-    name = os.environ.get('TI_CURRENT_BENCHMARK')
-    if name is None:
-        return
+def benchmark_plot(fn=None,
+                   cases=None,
+                   columns=None,
+                   archs=None,
+                   title=None,
+                   bars='sync_vs_async',
+                   bar_width=0.4,
+                   bar_distance=0,
+                   left_margin=0):
     import taichi as ti
-    arch_name = ti.core.arch_name(ti.cfg.arch)
+    import yaml
+    import matplotlib.pyplot as plt
+    if fn is None:
+        fn = os.path.join(ti.core.get_repo_dir(), 'benchmarks', 'output',
+                          'benchmark.yml')
+
+    with open(fn, 'r') as f:
+        data = yaml.load(f, Loader=yaml.SafeLoader)
+    if bars != 'sync_vs_async':  # need baseline
+        baseline_dir = os.path.join(ti.core.get_repo_dir(), 'benchmarks',
+                                    'baseline')
+        baseline_file = f'{baseline_dir}/benchmark.yml'
+        with open(baseline_file, 'r') as f:
+            baseline_data = yaml.load(f, Loader=yaml.SafeLoader)
+    if cases is None:
+        cases = list(data.keys())
+
+    assert len(cases) >= 1
+    if len(cases) == 1:
+        cases = [cases[0], cases[0]]
+        ti.warning(
+            'Function benchmark_plot does not support plotting with only one case for now. Duplicating the item to move on.'
+        )
+
+    if columns is None:
+        columns = list(data[cases[0]].keys())
+    normalize_to_lowest = lambda x: True
+    figure, subfigures = plt.subplots(len(cases), len(columns))
+    if title is None:
+        title = 'Taichi Performance Benchmarks (Higher means more)'
+    figure.suptitle(title, fontweight="bold")
+    for col_id in range(len(columns)):
+        subfigures[0][col_id].set_title(columns[col_id])
+    for case_id in range(len(cases)):
+        case = cases[case_id]
+        subfigures[case_id][0].annotate(
+            case,
+            xy=(0, 0.5),
+            xytext=(-subfigures[case_id][0].yaxis.labelpad - 5, 0),
+            xycoords=subfigures[case_id][0].yaxis.label,
+            textcoords='offset points',
+            size='large',
+            ha='right',
+            va='center')
+        for col_id in range(len(columns)):
+            col = columns[col_id]
+            if archs is None:
+                current_archs = data[case][col].keys()
+            else:
+                current_archs = archs & data[case][col].keys()
+            if bars == 'sync_vs_async':
+                y_left = [
+                    data[case][col][arch]['sync'] for arch in current_archs
+                ]
+                label_left = 'sync'
+                y_right = [
+                    data[case][col][arch]['async'] for arch in current_archs
+                ]
+                label_right = 'async'
+            elif bars == 'sync_regression':
+                y_left = [
+                    baseline_data[case][col][arch]['sync']
+                    for arch in current_archs
+                ]
+                label_left = 'before'
+                y_right = [
+                    data[case][col][arch]['sync'] for arch in current_archs
+                ]
+                label_right = 'after'
+            elif bars == 'async_regression':
+                y_left = [
+                    baseline_data[case][col][arch]['async']
+                    for arch in current_archs
+                ]
+                label_left = 'before'
+                y_right = [
+                    data[case][col][arch]['async'] for arch in current_archs
+                ]
+                label_right = 'after'
+            else:
+                raise RuntimeError('Unknown bars type')
+            if normalize_to_lowest(col):
+                for i in range(len(current_archs)):
+                    maximum = max(y_left[i], y_right[i])
+                    y_left[i] = y_left[i] / maximum if y_left[i] != 0 else 1
+                    y_right[i] = y_right[i] / maximum if y_right[i] != 0 else 1
+            ax = subfigures[case_id][col_id]
+            bar_left = ax.bar(x=[
+                i - bar_width / 2 - bar_distance / 2
+                for i in range(len(current_archs))
+            ],
+                              height=y_left,
+                              width=bar_width,
+                              label=label_left,
+                              color=(0.3, 0.7, 0.9, 1.0))
+            bar_right = ax.bar(x=[
+                i + bar_width / 2 + bar_distance / 2
+                for i in range(len(current_archs))
+            ],
+                               height=y_right,
+                               width=bar_width,
+                               label=label_right,
+                               color=(0.8, 0.2, 0.3, 1.0))
+            ax.set_xticks(range(len(current_archs)))
+            ax.set_xticklabels(current_archs)
+            figure.legend((bar_left, bar_right), (label_left, label_right),
+                          loc='lower center')
+    figure.subplots_adjust(left=left_margin)
+
+    fig = plt.gcf()
+    fig.set_size_inches(13, 8)
+
+    plt.show()
+
+
+def stat_write(key, value):
+    import taichi as ti
+    import yaml
+    case_name = os.environ.get('TI_CURRENT_BENCHMARK')
+    if case_name is None:
+        return
+    if case_name.startswith('benchmark_'):
+        case_name = case_name[10:]
+    arch_name = core.arch_name(ti.cfg.arch)
+    async_mode = 'async' if ti.cfg.async_mode else 'sync'
     output_dir = os.environ.get('TI_BENCHMARK_OUTPUT_DIR', '.')
-    filename = f'{output_dir}/{name}__arch_{arch_name}.dat'
+    filename = f'{output_dir}/benchmark.yml'
+    try:
+        with open(filename, 'r') as f:
+            data = yaml.load(f, Loader=yaml.SafeLoader)
+    except FileNotFoundError:
+        data = {}
+    data.setdefault(case_name, {})
+    data[case_name].setdefault(key, {})
+    data[case_name][key].setdefault(arch_name, {})
+    data[case_name][key][arch_name][async_mode] = value
     with open(filename, 'w') as f:
-        f.write(f'time_avg: {avg:.4f}')
+        yaml.dump(data, f, Dumper=yaml.SafeDumper)
+
+
+def is_arch_supported(arch):
+    arch_table = {
+        cuda: core.with_cuda,
+        metal: core.with_metal,
+        opengl: core.with_opengl,
+        cc: core.with_cc,
+        cpu: lambda: True
+    }
+    with_arch = arch_table.get(arch, lambda: False)
+    try:
+        return with_arch()
+    except Exception as e:
+        arch = core.arch_name(arch)
+        core.warn(
+            f"{e.__class__.__name__}: '{e}' occurred when detecting "
+            f"{arch}, consider add `export TI_WITH_{arch.upper()}=0` "
+            f" to environment variables to depress this warning message.")
+        return False
 
 
 def supported_archs():
-    import taichi as ti
-    archs = [ti.core.host_arch()]
-    if ti.core.with_cuda():
-        archs.append(cuda)
-    if ti.core.with_metal():
-        archs.append(metal)
-    if ti.core.with_opengl():
-        archs.append(opengl)
+    archs = [cpu, cuda, metal, opengl, cc]
+
     wanted_archs = os.environ.get('TI_WANTED_ARCHS', '')
     want_exclude = wanted_archs.startswith('^')
     if want_exclude:
@@ -294,22 +542,27 @@ def supported_archs():
     if len(wanted_archs):
         archs, old_archs = [], archs
         for arch in old_archs:
-            if want_exclude == (ti.core.arch_name(arch) not in wanted_archs):
+            if want_exclude == (core.arch_name(arch) not in wanted_archs):
                 archs.append(arch)
+
+    archs, old_archs = [], archs
+    for arch in old_archs:
+        if is_arch_supported(arch):
+            archs.append(arch)
+
     return archs
 
 
 def adaptive_arch_select(arch):
     if arch is None:
         return cpu
-    supported = supported_archs()
-    if isinstance(arch, list):
-        for a in arch:
-            if a in supported:
-                return a
-    elif arch in supported:
-        return arch
-    print(f'Arch={arch} not supported, falling back to CPU')
+    import taichi as ti
+    if not isinstance(arch, (list, tuple)):
+        arch = [arch]
+    for a in arch:
+        if is_arch_supported(a):
+            return a
+    ti.warn(f'Arch={arch} is not supported, falling back to CPU')
     return cpu
 
 
@@ -355,8 +608,8 @@ def all_archs_with(**kwargs):
             fp = kwargs.get('default_fp', ti.f32)
             ip = kwargs.get('default_ip', ti.i32)
             if fp == ti.f64 or ip == ti.i64:
-                can_run_on.register(
-                    lambda arch: is_supported(arch, extension.data64))
+                can_run_on.register(lambda arch: is_extension_supported(
+                    arch, extension.data64))
 
             for arch in ti.supported_archs():
                 if can_run_on(arch):
@@ -424,7 +677,7 @@ def require(*exts):
         @functools.wraps(test)
         def wrapped(*test_args, **test_kwargs):
             def checker(arch):
-                return all([is_supported(arch, e) for e in exts])
+                return all([is_extension_supported(arch, e) for e in exts])
 
             _get_or_make_arch_checkers(test_kwargs).register(checker)
             test(*test_args, **test_kwargs)
@@ -460,6 +713,28 @@ def host_arch_only(func):
             func(*args, **kwargs)
 
     return test
+
+
+def archs_with(archs, **init_kwags):
+    """
+    Run the test on the given archs with the given init args.
+
+    Args:
+      archs: a list of Taichi archs
+      init_kwargs: kwargs passed to ti.init()
+    """
+    import taichi as ti
+
+    def decorator(test):
+        @functools.wraps(test)
+        def wrapped(*test_args, **test_kwargs):
+            for arch in archs:
+                ti.init(arch=arch, **init_kwags)
+                test(*test_args, **test_kwargs)
+
+        return wrapped
+
+    return decorator
 
 
 def must_throw(ex):

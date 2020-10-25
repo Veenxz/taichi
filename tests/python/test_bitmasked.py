@@ -2,14 +2,14 @@ import taichi as ti
 
 
 def archs_support_bitmasked(func):
-    return ti.archs_excluding(ti.opengl)(func)
+    return ti.archs_excluding(ti.opengl, ti.cc)(func)
 
 
 @archs_support_bitmasked
 def test_basic():
-    x = ti.var(ti.i32)
-    c = ti.var(ti.i32)
-    s = ti.var(ti.i32)
+    x = ti.field(ti.i32)
+    c = ti.field(ti.i32)
+    s = ti.field(ti.i32)
 
     bm = ti.root.bitmasked(ti.ij, (3, 6)).bitmasked(ti.i, 5)
     bm.place(x)
@@ -36,8 +36,8 @@ def test_basic():
 
 @archs_support_bitmasked
 def test_bitmasked_then_dense():
-    x = ti.var(ti.f32)
-    s = ti.var(ti.i32)
+    x = ti.field(ti.f32)
+    s = ti.field(ti.i32)
 
     n = 128
 
@@ -60,8 +60,8 @@ def test_bitmasked_then_dense():
 
 @archs_support_bitmasked
 def test_bitmasked_bitmasked():
-    x = ti.var(ti.f32)
-    s = ti.var(ti.i32)
+    x = ti.field(ti.f32)
+    s = ti.field(ti.i32)
 
     n = 128
 
@@ -85,8 +85,8 @@ def test_bitmasked_bitmasked():
 @archs_support_bitmasked
 def test_huge_bitmasked():
     # Mainly for testing Metal listgen's grid-stride loop implementation.
-    x = ti.var(ti.f32)
-    s = ti.var(ti.i32)
+    x = ti.field(ti.f32)
+    s = ti.field(ti.i32)
 
     n = 1024
 
@@ -115,8 +115,8 @@ def test_bitmasked_listgen_bounded():
     # elements possible for that SNode. Note that 1) SNode's size is padded
     # to POT, and 2) Metal ListManager's data size is not padded, we need to
     # make sure listgen doesn't go beyond ListManager's capacity.
-    x = ti.var(ti.i32)
-    c = ti.var(ti.i32)
+    x = ti.field(ti.i32)
+    c = ti.field(ti.i32)
 
     # A prime that is bit higher than 65536, which is Metal's maximum number of
     # threads for listgen.
@@ -143,11 +143,11 @@ def test_bitmasked_listgen_bounded():
 @archs_support_bitmasked
 def test_deactivate():
     # https://github.com/taichi-dev/taichi/issues/778
-    a = ti.var(ti.i32)
+    a = ti.field(ti.i32)
     a_a = ti.root.bitmasked(ti.i, 4)
     a_b = a_a.dense(ti.i, 4)
     a_b.place(a)
-    c = ti.var(ti.i32)
+    c = ti.field(ti.i32)
     ti.root.place(c)
 
     @ti.kernel
@@ -173,9 +173,9 @@ def test_deactivate():
 
 @archs_support_bitmasked
 def test_sparsity_changes():
-    x = ti.var(ti.i32)
-    c = ti.var(ti.i32)
-    s = ti.var(ti.i32)
+    x = ti.field(ti.i32)
+    c = ti.field(ti.i32)
+    s = ti.field(ti.i32)
 
     bm = ti.root.bitmasked(ti.i, 5).bitmasked(ti.i, 3)
     bm.place(x)
@@ -203,3 +203,42 @@ def test_sparsity_changes():
     run()
     assert c[None] == 4
     assert s[None] == 42
+
+
+@archs_support_bitmasked
+def test_bitmasked_offset_child():
+    x = ti.field(ti.i32)
+    x2 = ti.field(ti.i32)
+    y = ti.field(ti.i32)
+    y2 = ti.field(ti.i32)
+    y3 = ti.field(ti.i32)
+    z = ti.field(ti.i32)
+    s = ti.field(ti.i32, shape=())
+
+    n = 16
+    # Offset children:
+    # * In |bm|'s cell: |bm2| has a non-zero offset
+    # * In |bm2|'s cell: |z| has a non-zero offset
+    # * We iterate over |z| to test the listgen handles offsets correctly
+    bm = ti.root.bitmasked(ti.i, n)
+    bm.dense(ti.i, 16).place(x, x2)
+    bm2 = bm.bitmasked(ti.i, 4)
+
+    bm2.dense(ti.i, 4).place(y, y2, y3)
+    bm2.bitmasked(ti.i, 4).place(z)
+
+    @ti.kernel
+    def func():
+        for _ in z:
+            s[None] += 1
+
+    z[0] = 1
+    z[7] = 1
+    z[42] = 1
+    z[53] = 1
+    z[88] = 1
+    z[101] = 1
+    z[233] = 1
+
+    func()
+    assert s[None] == 7

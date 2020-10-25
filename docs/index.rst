@@ -17,7 +17,6 @@ The Taichi Programming Language
    syntax
    type
    tensor_matrix
-   atomic
    external
 
 
@@ -28,6 +27,8 @@ The Taichi Programming Language
    scalar_tensor
    vector
    matrix
+   arithmetics
+   atomic
    snode
 
 
@@ -38,33 +39,41 @@ The Taichi Programming Language
    meta
    layout
    sparse
-   offset
    differentiable_programming
+   performance
    odop
-   compilation
    syntax_sugars
+   offset
 
 
 .. toctree::
    :caption: Contributing
-   :maxdepth: 1
+   :maxdepth: 3
 
    dev_install
    contributor_guide
+   write_test
    utilities
+   profiler
    cpp_style
+   compilation
    internal
    taichicon
+   versioning_releases
 
 
 .. toctree::
    :caption: Miscellaneous
    :maxdepth: 3
 
-   gui
-   export_results
-   global_settings
    faq
+   gui
+   debugging
+   export_results
+   cli_utilities
+   global_settings
+   export_kernels
+   extension_libraries
    acknowledgments
 
 

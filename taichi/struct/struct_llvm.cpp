@@ -1,11 +1,13 @@
 // Codegen for the hierarchical data structure (LLVM)
 
-#include "struct_llvm.h"
-#include "taichi/ir/ir.h"
-#include "taichi/program/program.h"
-#include "struct.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IR/IRBuilder.h"
+
+#include "taichi/ir/ir.h"
+#include "taichi/struct/struct.h"
+#include "taichi/struct/struct_llvm.h"
+#include "taichi/program/program.h"
+#include "taichi/util/file_sequence_writer.h"
 
 TLANG_NAMESPACE_BEGIN
 
@@ -23,6 +25,8 @@ StructCompilerLLVM::StructCompilerLLVM(Program *prog, Arch arch)
 void StructCompilerLLVM::generate_types(SNode &snode) {
   TI_AUTO_PROF;
   auto type = snode.type;
+  if (snode.is_bit_level)
+    return;
   llvm::Type *node_type = nullptr;
 
   auto ctx = llvm_ctx;
@@ -32,8 +36,11 @@ void StructCompilerLLVM::generate_types(SNode &snode) {
 
   std::vector<llvm::Type *> ch_types;
   for (int i = 0; i < snode.ch.size(); i++) {
-    auto ch = get_llvm_node_type(module.get(), snode.ch[i].get());
-    ch_types.push_back(ch);
+    if (!snode.ch[i]->is_bit_level) {
+      // Bit-level SNodes do not really have a corresponding LLVM type
+      auto ch = get_llvm_node_type(module.get(), snode.ch[i].get());
+      ch_types.push_back(ch);
+    }
   }
 
   auto ch_type =
@@ -51,6 +58,23 @@ void StructCompilerLLVM::generate_types(SNode &snode) {
     body_type = ch_type;
   } else if (type == SNodeType::place) {
     body_type = tlctx->get_data_type(snode.dt);
+  } else if (type == SNodeType::bit_struct) {
+    // Generate the bit_struct type
+    std::vector<Type *> ch_types;
+    std::vector<int> ch_offsets;
+    int total_offset = 0;
+    for (int i = 0; i < snode.ch.size(); i++) {
+      auto &ch = snode.ch[i];
+      ch_types.push_back(ch->dt.get_ptr());
+      ch_offsets.push_back(total_offset);
+      total_offset += ch->dt->as<CustomIntType>()->get_num_bits();
+    }
+
+    snode.dt = TypeFactory::get_instance().get_bit_struct_type(
+        snode.physical_type, ch_types, ch_offsets);
+
+    DataType container_primitive_type(snode.physical_type);
+    body_type = tlctx->get_data_type(container_primitive_type);
   } else if (type == SNodeType::pointer) {
     // mutex
     aux_type = llvm::ArrayType::get(llvm::PointerType::getInt64Ty(*ctx),
@@ -183,7 +207,8 @@ void StructCompilerLLVM::generate_child_accessors(SNode &snode) {
   }
 
   for (auto &ch : snode.ch) {
-    generate_child_accessors(*ch);
+    if (!ch->is_bit_level)
+      generate_child_accessors(*ch);
   }
 
   stack.pop_back();
@@ -198,8 +223,10 @@ void StructCompilerLLVM::run(SNode &root, bool host) {
   // bottom to top
   collect_snodes(root);
 
-  if (host)
+  if (host) {
     infer_snode_properties(root);
+    compute_trailing_bits(root);
+  }
 
   auto snodes_rev = snodes;
   std::reverse(snodes_rev.begin(), snodes_rev.end());
@@ -210,8 +237,9 @@ void StructCompilerLLVM::run(SNode &root, bool host) {
   generate_child_accessors(root);
 
   if (prog->config.print_struct_llvm_ir) {
-    TI_INFO("Struct Module IR");
-    module->print(errs(), nullptr);
+    static FileSequenceWriter writer("taichi_struct_llvm_ir_{:04d}.ll",
+                                     "struct LLVM IR");
+    writer.write(module.get());
   }
 
   TI_ASSERT((int)snodes.size() <= taichi_max_num_snodes);

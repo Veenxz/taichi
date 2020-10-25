@@ -6,6 +6,8 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <variant>
+#include <tuple>
+
 #include "taichi/common/core.h"
 #include "taichi/util/bit.h"
 #include "taichi/lang_util.h"
@@ -31,44 +33,6 @@ using ScratchPadOptions = std::vector<std::pair<int, SNode *>>;
 #undef PER_STATEMENT
 
 IRBuilder &current_ast_builder();
-
-bool maybe_same_address(Stmt *var1, Stmt *var2);
-
-struct VectorType {
- private:
-  bool _is_pointer;
-
- public:
-  int width;
-  DataType data_type;
-
-  VectorType(int width, DataType data_type, bool is_pointer = false)
-      : _is_pointer(is_pointer), width(width), data_type(data_type) {
-  }
-
-  VectorType() : _is_pointer(false), width(1), data_type(DataType::unknown) {
-  }
-
-  bool operator==(const VectorType &o) const {
-    return width == o.width && data_type == o.data_type;
-  }
-
-  bool operator!=(const VectorType &o) const {
-    return !(*this == o);
-  }
-
-  std::string pointer_suffix() const;
-  std::string element_type_name() const;
-  std::string str() const;
-
-  bool is_pointer() const {
-    return _is_pointer;
-  }
-
-  void set_is_pointer(bool v) {
-    _is_pointer = v;
-  }
-};
 
 class DecoratorRecorder {
  public:
@@ -215,6 +179,8 @@ class IRVisitor {
     invoke_default_visitor = false;
   }
 
+  virtual ~IRVisitor() = default;
+
   // default visitor
   virtual void visit(Stmt *stmt) {
     if (!allow_undefined_visitor) {
@@ -240,15 +206,26 @@ class IRVisitor {
 #undef PER_STATEMENT
 };
 
+struct CompileConfig;
+
 class IRNode {
  public:
+  Kernel *kernel;
+
   virtual void accept(IRVisitor *visitor) {
     TI_NOT_IMPLEMENTED
   }
-  virtual Kernel *get_kernel() const {
-    return nullptr;
-  }
+
+  // * For a Stmt, this returns its enclosing Block
+  // * For a Block, this returns its enclosing Stmt
+  virtual IRNode *get_parent() const = 0;
+
+  IRNode *get_ir_root();
+  Kernel *get_kernel() const;
+
   virtual ~IRNode() = default;
+
+  CompileConfig &get_config() const;
 
   template <typename T>
   bool is() const {
@@ -262,8 +239,19 @@ class IRNode {
   }
 
   template <typename T>
+  const T *as() const {
+    TI_ASSERT(is<T>());
+    return dynamic_cast<const T *>(this);
+  }
+
+  template <typename T>
   T *cast() {
     return dynamic_cast<T *>(this);
+  }
+
+  template <typename T>
+  const T *cast() const {
+    return dynamic_cast<const T *>(this);
   }
 
   std::unique_ptr<IRNode> clone();
@@ -418,15 +406,29 @@ class StmtField {
 template <typename T>
 class StmtFieldNumeric final : public StmtField {
  private:
-  T value;
+  std::variant<T *, T> value;
 
  public:
+  explicit StmtFieldNumeric(T *value) : value(value) {
+  }
+
   explicit StmtFieldNumeric(T value) : value(value) {
   }
 
   bool equal(const StmtField *other_generic) const override {
     if (auto other = dynamic_cast<const StmtFieldNumeric *>(other_generic)) {
-      return other->value == value;
+      if (std::holds_alternative<T *>(other->value) &&
+          std::holds_alternative<T *>(value)) {
+        return *(std::get<T *>(other->value)) == *(std::get<T *>(value));
+      } else if (std::holds_alternative<T *>(other->value) ||
+                 std::holds_alternative<T *>(value)) {
+        TI_ERROR(
+            "Inconsistent StmtField value types: a pointer value is compared "
+            "to a non-pointer value.");
+        return false;
+      } else {
+        return std::get<T>(other->value) == std::get<T>(value);
+      }
     } else {
       // Different types
       return false;
@@ -492,18 +494,13 @@ class Stmt : public IRNode {
   bool erased;
   bool fields_registered;
   std::string tb;
-  bool is_ptr;
-  VectorType ret_type;
+  DataType ret_type;
 
   Stmt();
   Stmt(const Stmt &stmt);
 
-  int &width() {
-    return ret_type.width;
-  }
-
-  const int &width() const {
-    return ret_type.width;
+  int width() const {
+    return ret_type->vector_width();
   }
 
   virtual bool is_container_statement() const {
@@ -511,11 +508,11 @@ class Stmt : public IRNode {
   }
 
   DataType &element_type() {
-    return ret_type.data_type;
+    return ret_type;
   }
 
   std::string ret_data_type_name() const {
-    return ret_type.str();
+    return ret_type->to_string();
   }
 
   std::string type_hint() const;
@@ -554,12 +551,11 @@ class Stmt : public IRNode {
   void replace_with(VecStatement &&new_statements, bool replace_usages = true);
   virtual void replace_operand_with(Stmt *old_stmt, Stmt *new_stmt);
 
-  IRNode *get_ir_root();
-
-  Kernel *get_kernel() const override;
+  IRNode *get_parent() const override;
 
   virtual void repeat(int factor) {
-    ret_type.width *= factor;
+    TI_ASSERT(factor == 1);
+    // ret_type.width *= factor;
   }
 
   // returns the inserted stmt
@@ -570,6 +566,14 @@ class Stmt : public IRNode {
 
   virtual bool has_global_side_effect() const {
     return true;
+  }
+
+  virtual bool dead_instruction_eliminable() const {
+    return !has_global_side_effect();
+  }
+
+  virtual bool common_statement_eliminable() const {
+    return !has_global_side_effect();
   }
 
   template <typename T, typename... Args>
@@ -597,224 +601,12 @@ class Stmt : public IRNode {
   virtual ~Stmt() override = default;
 };
 
-class AllocaStmt : public Stmt {
- public:
-  AllocaStmt(DataType type) {
-    ret_type = VectorType(1, type);
-    TI_STMT_REG_FIELDS;
-  }
-
-  AllocaStmt(int width, DataType type) {
-    ret_type = VectorType(width, type);
-    TI_STMT_REG_FIELDS;
-  }
-
-  virtual bool has_global_side_effect() const override {
-    return false;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type);
-  TI_DEFINE_ACCEPT_AND_CLONE
-};
-
-// updates mask, break if no active
-class WhileControlStmt : public Stmt {
- public:
-  Stmt *mask;
-  Stmt *cond;
-  WhileControlStmt(Stmt *mask, Stmt *cond) : mask(mask), cond(cond) {
-    TI_STMT_REG_FIELDS;
-  }
-
-  TI_STMT_DEF_FIELDS(mask, cond);
-  TI_DEFINE_ACCEPT_AND_CLONE;
-};
-
-class ContinueStmt : public Stmt {
- public:
-  // This is the loop on which this continue stmt has effects. It can be either
-  // an offloaded task, or a for/while loop inside the kernel.
-  Stmt *scope;
-
-  ContinueStmt() : scope(nullptr) {
-    TI_STMT_REG_FIELDS;
-  }
-
-  // For top-level loops, since they are parallelized to multiple threads (on
-  // either CPU or GPU), `continue` becomes semantically equivalent to `return`.
-  //
-  // Caveat:
-  // We should wrap each backend's kernel body into a function (as LLVM does).
-  // The reason is that, each thread may handle more than one element,
-  // depending on the backend's implementation.
-  //
-  // For example, CUDA uses gride-stride loops, the snippet below illustrates
-  // the idea:
-  //
-  // __global__ foo_kernel(...) {
-  //   for (int i = lower; i < upper; i += gridDim) {
-  //     auto coord = compute_coords(i);
-  //     // run_foo_kernel is produced by codegen
-  //     run_foo_kernel(coord);
-  //   }
-  // }
-  //
-  // If run_foo_kernel() is directly inlined within foo_kernel(), `return`
-  // could prematurely terminate the entire kernel.
-  bool as_return() const;
-
-  TI_STMT_DEF_FIELDS(scope);
-  TI_DEFINE_ACCEPT_AND_CLONE;
-};
-
-class UnaryOpStmt : public Stmt {
- public:
-  UnaryOpType op_type;
-  Stmt *operand;
-  DataType cast_type;
-
-  UnaryOpStmt(UnaryOpType op_type, Stmt *operand);
-
-  bool same_operation(UnaryOpStmt *o) const;
-  bool is_cast() const;
-
-  virtual bool has_global_side_effect() const override {
-    return false;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type, op_type, operand, cast_type);
-  TI_DEFINE_ACCEPT_AND_CLONE
-};
-
-class ArgLoadStmt : public Stmt {
- public:
-  int arg_id;
-
-  ArgLoadStmt(int arg_id, bool is_ptr = false) : arg_id(arg_id) {
-    this->is_ptr = is_ptr;
-    TI_STMT_REG_FIELDS;
-  }
-
-  virtual bool has_global_side_effect() const override {
-    return false;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type, arg_id, is_ptr);
-  TI_DEFINE_ACCEPT_AND_CLONE
-};
-
-class RandStmt : public Stmt {
- public:
-  RandStmt(DataType dt) {
-    ret_type.data_type = dt;
-    TI_STMT_REG_FIELDS;
-  }
-
-  virtual bool has_global_side_effect() const override {
-    return false;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type);
-  TI_DEFINE_ACCEPT_AND_CLONE
-};
-
-class BinaryOpStmt : public Stmt {
- public:
-  BinaryOpType op_type;
-  Stmt *lhs, *rhs;
-
-  BinaryOpStmt(BinaryOpType op_type, Stmt *lhs, Stmt *rhs)
-      : op_type(op_type), lhs(lhs), rhs(rhs) {
-    TI_ASSERT(!lhs->is<AllocaStmt>());
-    TI_ASSERT(!rhs->is<AllocaStmt>());
-    TI_STMT_REG_FIELDS;
-  }
-
-  virtual bool has_global_side_effect() const override {
-    return false;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type, op_type, lhs, rhs);
-  TI_DEFINE_ACCEPT_AND_CLONE
-};
-
-class TernaryOpStmt : public Stmt {
- public:
-  TernaryOpType op_type;
-  Stmt *op1, *op2, *op3;
-
-  TernaryOpStmt(TernaryOpType op_type, Stmt *op1, Stmt *op2, Stmt *op3)
-      : op_type(op_type), op1(op1), op2(op2), op3(op3) {
-    TI_ASSERT(!op1->is<AllocaStmt>());
-    TI_ASSERT(!op2->is<AllocaStmt>());
-    TI_ASSERT(!op3->is<AllocaStmt>());
-    TI_STMT_REG_FIELDS;
-  }
-
-  virtual bool has_global_side_effect() const override {
-    return false;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type, op1, op2, op3);
-  TI_DEFINE_ACCEPT_AND_CLONE
-};
-
-class AtomicOpStmt : public Stmt {
- public:
-  AtomicOpType op_type;
-  Stmt *dest, *val;
-
-  AtomicOpStmt(AtomicOpType op_type, Stmt *dest, Stmt *val)
-      : op_type(op_type), dest(dest), val(val) {
-    TI_STMT_REG_FIELDS;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type, op_type, dest, val);
-  TI_DEFINE_ACCEPT_AND_CLONE
-};
-
-class ExternalPtrStmt : public Stmt {
- public:
-  LaneAttribute<Stmt *> base_ptrs;
-  std::vector<Stmt *> indices;
-  bool activate;
-
-  ExternalPtrStmt(const LaneAttribute<Stmt *> &base_ptrs,
-                  const std::vector<Stmt *> &indices);
-
-  virtual bool has_global_side_effect() const override {
-    return false;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type, base_ptrs, indices, activate);
-  TI_DEFINE_ACCEPT_AND_CLONE
-};
-
-class GlobalPtrStmt : public Stmt {
- public:
-  LaneAttribute<SNode *> snodes;
-  std::vector<Stmt *> indices;
-  bool activate;
-
-  GlobalPtrStmt(const LaneAttribute<SNode *> &snodes,
-                const std::vector<Stmt *> &indices,
-                bool activate = true);
-
-  virtual bool has_global_side_effect() const override {
-    return activate;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type, snodes, indices, activate);
-  TI_DEFINE_ACCEPT_AND_CLONE
-};
-
 class Block : public IRNode {
  public:
-  Block *parent;
+  Stmt *parent_stmt;
   std::vector<std::unique_ptr<Stmt>> statements, trash_bin;
   Stmt *mask_var;
   std::vector<SNode *> stop_gradients;
-  Kernel *kernel;
 
   // Only used in frontend. Stores LoopIndexStmt or BinaryOpStmt for loop
   // variables, and AllocaStmt for other variables.
@@ -822,9 +614,11 @@ class Block : public IRNode {
 
   Block() {
     mask_var = nullptr;
-    parent = nullptr;
+    parent_stmt = nullptr;
     kernel = nullptr;
   }
+
+  Block *parent_block() const;
 
   bool has_container_statements();
   int locate(Stmt *stmt);
@@ -832,8 +626,13 @@ class Block : public IRNode {
   void erase(Stmt *stmt);
   std::unique_ptr<Stmt> extract(int location);
   std::unique_ptr<Stmt> extract(Stmt *stmt);
-  void insert(std::unique_ptr<Stmt> &&stmt, int location = -1);
-  void insert(VecStatement &&stmt, int location = -1);
+
+  // Returns stmt.get()
+  Stmt *insert(std::unique_ptr<Stmt> &&stmt, int location = -1);
+
+  // Returns stmt.back().get() or nullptr if stmt is empty
+  Stmt *insert(VecStatement &&stmt, int location = -1);
+
   void replace_statements_in_range(int start, int end, VecStatement &&stmts);
   void set_statements(VecStatement &&stmts);
   void replace_with(Stmt *old_statement,
@@ -846,7 +645,7 @@ class Block : public IRNode {
                     bool replace_usages = true);
   Stmt *lookup_var(const Identifier &ident) const;
   Stmt *mask();
-  Kernel *get_kernel() const override;
+  IRNode *get_parent() const override;
 
   Stmt *back() const {
     return statements.back().get();
@@ -877,6 +676,7 @@ class DelayedIRModifier {
  private:
   std::vector<std::pair<Stmt *, VecStatement>> to_insert_before;
   std::vector<std::pair<Stmt *, VecStatement>> to_insert_after;
+  std::vector<std::tuple<Stmt *, VecStatement, bool>> to_replace_with;
   std::vector<Stmt *> to_erase;
 
  public:
@@ -886,347 +686,21 @@ class DelayedIRModifier {
   void insert_before(Stmt *old_statement, VecStatement &&new_statements);
   void insert_after(Stmt *old_statement, std::unique_ptr<Stmt> new_statement);
   void insert_after(Stmt *old_statement, VecStatement &&new_statements);
+  void replace_with(Stmt *stmt,
+                    VecStatement &&new_statements,
+                    bool replace_usages = true);
   bool modify_ir();
-};
-
-class SNodeOpStmt : public Stmt {
- public:
-  SNodeOpType op_type;
-  SNode *snode;
-  Stmt *ptr;
-  Stmt *val;
-  std::vector<Stmt *> indices;
-
-  SNodeOpStmt(SNodeOpType op_type,
-              SNode *snode,
-              Stmt *ptr,
-              Stmt *val = nullptr);
-
-  SNodeOpStmt(SNodeOpType op_type,
-              SNode *snode,
-              const std::vector<Stmt *> &indices);
-
-  static bool activation_related(SNodeOpType op) {
-    return op == SNodeOpType::activate || op == SNodeOpType::deactivate ||
-           op == SNodeOpType::is_active;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type, op_type, snode, ptr, val, indices);
-  TI_DEFINE_ACCEPT_AND_CLONE
-};
-
-class AssertStmt : public Stmt {
- public:
-  Stmt *cond;
-  std::string text;
-  std::vector<Stmt *> args;
-
-  AssertStmt(const std::string &text, Stmt *cond) : cond(cond), text(text) {
-    TI_ASSERT(cond);
-    TI_STMT_REG_FIELDS;
-  }
-
-  AssertStmt(Stmt *cond,
-             const std::string &text,
-             const std::vector<Stmt *> &args)
-      : cond(cond), text(text), args(args) {
-    TI_ASSERT(cond);
-    TI_STMT_REG_FIELDS;
-  }
-
-  TI_STMT_DEF_FIELDS(cond, text, args);
-  TI_DEFINE_ACCEPT_AND_CLONE
-};
-
-class RangeAssumptionStmt : public Stmt {
- public:
-  Stmt *input;
-  Stmt *base;
-  int low, high;
-
-  RangeAssumptionStmt(Stmt *input, Stmt *base, int low, int high)
-      : input(input), base(base), low(low), high(high) {
-    TI_STMT_REG_FIELDS;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type, input, base, low, high);
-  TI_DEFINE_ACCEPT_AND_CLONE
-};
-
-class GlobalLoadStmt : public Stmt {
- public:
-  Stmt *ptr;
-
-  GlobalLoadStmt(Stmt *ptr) : ptr(ptr) {
-    TI_STMT_REG_FIELDS;
-  }
-
-  virtual bool has_global_side_effect() const override {
-    return false;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type, ptr);
-  TI_DEFINE_ACCEPT_AND_CLONE;
-};
-
-class GlobalStoreStmt : public Stmt {
- public:
-  Stmt *ptr, *data;
-
-  GlobalStoreStmt(Stmt *ptr, Stmt *data) : ptr(ptr), data(data) {
-    TI_STMT_REG_FIELDS;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type, ptr, data);
-  TI_DEFINE_ACCEPT_AND_CLONE;
 };
 
 struct LocalAddress {
   Stmt *var;
   int offset;
 
-  LocalAddress(Stmt *var, int offset) : var(var), offset(offset) {
-    TI_ASSERT(var->is<AllocaStmt>());
-  }
+  LocalAddress(Stmt *var, int offset);
 };
 
 template <typename T>
 std::string to_string(const T &);
-
-class LocalLoadStmt : public Stmt {
- public:
-  LaneAttribute<LocalAddress> ptr;
-
-  LocalLoadStmt(const LaneAttribute<LocalAddress> &ptr) : ptr(ptr) {
-    TI_STMT_REG_FIELDS;
-  }
-
-  bool same_source() const;
-  bool has_source(Stmt *alloca) const;
-
-  Stmt *previous_store_or_alloca_in_block();
-
-  virtual bool has_global_side_effect() const override {
-    return false;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type, ptr);
-  TI_DEFINE_ACCEPT_AND_CLONE;
-};
-
-class LocalStoreStmt : public Stmt {
- public:
-  Stmt *ptr;
-  Stmt *data;
-
-  LocalStoreStmt(Stmt *ptr, Stmt *data) : ptr(ptr), data(data) {
-    TI_ASSERT(ptr->is<AllocaStmt>());
-    TI_STMT_REG_FIELDS;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type, ptr, data);
-  TI_DEFINE_ACCEPT_AND_CLONE;
-};
-
-class IfStmt : public Stmt {
- public:
-  Stmt *cond;
-  Stmt *true_mask, *false_mask;
-  std::unique_ptr<Block> true_statements, false_statements;
-
-  IfStmt(Stmt *cond) : cond(cond), true_mask(nullptr), false_mask(nullptr) {
-    TI_STMT_REG_FIELDS;
-  }
-
-  bool is_container_statement() const override {
-    return true;
-  }
-
-  std::unique_ptr<Stmt> clone() const override;
-
-  TI_STMT_DEF_FIELDS(cond, true_mask, false_mask);
-  TI_DEFINE_ACCEPT
-};
-
-class PrintStmt : public Stmt {
- public:
-  using EntryType = std::variant<Stmt *, std::string>;
-  std::vector<EntryType> contents;
-
-  PrintStmt(const std::vector<EntryType> &contents_) : contents(contents_) {
-    TI_STMT_REG_FIELDS;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type, contents);
-  TI_DEFINE_ACCEPT_AND_CLONE
-};
-
-class ConstStmt : public Stmt {
- public:
-  LaneAttribute<TypedConstant> val;
-
-  ConstStmt(const LaneAttribute<TypedConstant> &val) : val(val) {
-    width() = val.size();
-    element_type() = val[0].dt;
-    for (int i = 0; i < ret_type.width; i++) {
-      TI_ASSERT(val[0].dt == val[i].dt);
-    }
-    TI_STMT_REG_FIELDS;
-  }
-
-  void repeat(int factor) override {
-    Stmt::repeat(factor);
-    val.repeat(factor);
-  }
-
-  virtual bool has_global_side_effect() const override {
-    return false;
-  }
-
-  std::unique_ptr<ConstStmt> copy();
-
-  TI_STMT_DEF_FIELDS(ret_type, val);
-  TI_DEFINE_ACCEPT_AND_CLONE
-};
-
-// General range for
-class RangeForStmt : public Stmt {
- public:
-  Stmt *begin, *end;
-  std::unique_ptr<Block> body;
-  bool reversed;
-  int vectorize;
-  int parallelize;
-  int block_dim;
-  bool strictly_serialized;
-
-  RangeForStmt(Stmt *begin,
-               Stmt *end,
-               std::unique_ptr<Block> &&body,
-               int vectorize,
-               int parallelize,
-               int block_dim,
-               bool strictly_serialized);
-
-  bool is_container_statement() const override {
-    return true;
-  }
-
-  void reverse() {
-    reversed = !reversed;
-  }
-
-  std::unique_ptr<Stmt> clone() const override;
-
-  TI_STMT_DEF_FIELDS(begin,
-                     end,
-                     reversed,
-                     vectorize,
-                     parallelize,
-                     block_dim,
-                     strictly_serialized);
-  TI_DEFINE_ACCEPT
-};
-
-// for stmt over a structural node
-class StructForStmt : public Stmt {
- public:
-  SNode *snode;
-  std::unique_ptr<Block> body;
-  std::unique_ptr<Block> block_initialization;
-  std::unique_ptr<Block> block_finalization;
-  int vectorize;
-  int parallelize;
-  int block_dim;
-  ScratchPadOptions scratch_opt;
-
-  StructForStmt(SNode *snode,
-                std::unique_ptr<Block> &&body,
-                int vectorize,
-                int parallelize,
-                int block_dim);
-
-  bool is_container_statement() const override {
-    return true;
-  }
-
-  std::unique_ptr<Stmt> clone() const override;
-
-  TI_STMT_DEF_FIELDS(snode, vectorize, parallelize, block_dim, scratch_opt);
-  TI_DEFINE_ACCEPT
-};
-
-class FuncBodyStmt : public Stmt {
- public:
-  std::string funcid;
-  std::unique_ptr<Block> body;
-
-  FuncBodyStmt(const std::string &funcid, std::unique_ptr<Block> &&body)
-      : funcid(funcid), body(std::move(body)) {
-    TI_STMT_REG_FIELDS;
-  }
-
-  bool is_container_statement() const override {
-    return true;
-  }
-
-  std::unique_ptr<Stmt> clone() const override;
-
-  TI_STMT_DEF_FIELDS(funcid);
-  TI_DEFINE_ACCEPT
-};
-
-class FuncCallStmt : public Stmt {
- public:
-  std::string funcid;
-
-  FuncCallStmt(const std::string &funcid) : funcid(funcid) {
-    TI_STMT_REG_FIELDS;
-  }
-
-  bool is_container_statement() const override {
-    return false;
-  }
-
-  TI_STMT_DEF_FIELDS(ret_type, funcid);
-  TI_DEFINE_ACCEPT_AND_CLONE
-};
-
-class KernelReturnStmt : public Stmt {
- public:
-  Stmt *value;
-
-  KernelReturnStmt(Stmt *value) : value(value) {
-    TI_STMT_REG_FIELDS;
-  }
-
-  bool is_container_statement() const override {
-    return false;
-  }
-
-  TI_STMT_DEF_FIELDS(value);
-  TI_DEFINE_ACCEPT_AND_CLONE
-};
-
-class WhileStmt : public Stmt {
- public:
-  Stmt *mask;
-  std::unique_ptr<Block> body;
-
-  WhileStmt(std::unique_ptr<Block> &&body)
-      : mask(nullptr), body(std::move(body)) {
-    TI_STMT_REG_FIELDS;
-  }
-
-  bool is_container_statement() const override {
-    return true;
-  }
-
-  std::unique_ptr<Stmt> clone() const override;
-
-  TI_STMT_DEF_FIELDS(mask);
-  TI_DEFINE_ACCEPT
-};
 
 extern DecoratorRecorder dec;
 
@@ -1293,7 +767,7 @@ inline void StmtFieldManager::operator()(const char *key, T &&value) {
         std::make_unique<StmtFieldSNode>(value));
   } else {
     stmt->field_manager.fields.emplace_back(
-        std::make_unique<StmtFieldNumeric<T>>(value));
+        std::make_unique<StmtFieldNumeric<std::remove_reference_t<T>>>(&value));
   }
 }
 

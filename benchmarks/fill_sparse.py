@@ -3,12 +3,10 @@ import taichi as ti
 
 @ti.archs_support_sparse
 def benchmark_nested_struct():
-    a = ti.var(dt=ti.f32)
+    a = ti.field(dtype=ti.f32)
     N = 512
 
-    @ti.layout
-    def place():
-        ti.root.pointer(ti.ij, [N, N]).dense(ti.ij, [8, 8]).place(a)
+    ti.root.pointer(ti.ij, [N, N]).dense(ti.ij, [8, 8]).place(a)
 
     @ti.kernel
     def fill():
@@ -22,12 +20,10 @@ def benchmark_nested_struct():
 
 @ti.archs_support_sparse
 def benchmark_nested_struct_fill_and_clear():
-    a = ti.var(dt=ti.f32)
+    a = ti.field(dtype=ti.f32)
     N = 512
 
-    @ti.layout
-    def place():
-        ti.root.pointer(ti.ij, [N, N]).dense(ti.ij, [8, 8]).place(a)
+    ti.root.pointer(ti.ij, [N, N]).dense(ti.ij, [8, 8]).place(a)
 
     @ti.kernel
     def fill():
@@ -44,10 +40,3 @@ def benchmark_nested_struct_fill_and_clear():
         clear()
 
     return ti.benchmark(task, repeat=30)
-
-
-'''
-ti.init(arch=ti.cuda, enable_profiler=True)
-benchmark_nested_struct_fill_and_clear()
-ti.profiler_print()
-'''

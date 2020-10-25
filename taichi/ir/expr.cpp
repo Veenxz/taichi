@@ -72,13 +72,15 @@ Expr &Expr::operator=(const Expr &o) {
 }
 
 Expr Expr::parent() const {
-  TI_ASSERT(is<GlobalVariableExpression>());
+  TI_ASSERT_INFO(is<GlobalVariableExpression>(),
+                 "Cannot get snode parent of non-global variables.");
   return Expr::make<GlobalVariableExpression>(
       cast<GlobalVariableExpression>()->snode->parent);
 }
 
 SNode *Expr::snode() const {
-  TI_ASSERT(is<GlobalVariableExpression>());
+  TI_ASSERT_INFO(is<GlobalVariableExpression>(),
+                 "Cannot get snode of non-global variables.");
   return cast<GlobalVariableExpression>()->snode;
 }
 
@@ -160,10 +162,6 @@ void Cache(int v, const Expr &var) {
   dec.scratch_opt.push_back(std::make_pair(v, var.snode()));
 }
 
-void CacheL1(const Expr &var) {
-  dec.scratch_opt.push_back(std::make_pair(1, var.snode()));
-}
-
 Expr load_if_ptr(const Expr &ptr) {
   if (ptr.is<GlobalPtrExpression>()) {
     return load(ptr);
@@ -183,7 +181,9 @@ Expr load(const Expr &ptr) {
 Expr ptr_if_global(const Expr &var) {
   if (var.is<GlobalVariableExpression>()) {
     // singleton global variable
-    TI_ASSERT(var.snode()->num_active_indices == 0);
+    TI_ASSERT_INFO(var.snode()->num_active_indices == 0,
+                   "Please always use 'x[None]' (instead of simply 'x') to "
+                   "access any 0-D field.");
     return var[ExprGroup()];
   } else {
     // may be any local or global expr
@@ -194,7 +194,8 @@ Expr ptr_if_global(const Expr &var) {
 Expr Var(const Expr &x) {
   auto var = Expr(std::make_shared<IdExpression>());
   current_ast_builder().insert(std::make_unique<FrontendAllocaStmt>(
-      std::static_pointer_cast<IdExpression>(var.expr)->id, DataType::unknown));
+      std::static_pointer_cast<IdExpression>(var.expr)->id,
+      PrimitiveType::unknown));
   var = x;
   return var;
 }

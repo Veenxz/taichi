@@ -5,10 +5,6 @@
 
 TLANG_NAMESPACE_BEGIN
 
-// TODO(xumingkuan): Temporary variable for benchmarking.
-// TODO(xumingkuan): Will be removed in the future.
-extern bool advanced_optimization;
-
 struct CompileConfig {
   Arch arch;
   bool debug;
@@ -19,30 +15,54 @@ struct CompileConfig {
   int max_vector_width;
   bool print_ir;
   bool print_accessor_ir;
+  bool print_evaluator_ir;
   bool print_benchmark_stat;
   bool serial_schedule;
   bool simplify_before_lower_access;
   bool lower_access;
   bool simplify_after_lower_access;
   bool demote_dense_struct_fors;
+  bool advanced_optimization;
   bool use_llvm;
-  bool print_struct_llvm_ir;
-  bool print_kernel_llvm_ir;
-  bool print_kernel_llvm_ir_optimized;
   bool verbose_kernel_launches;
-  bool enable_profiler;
+  bool kernel_profiler;
   bool verbose;
   bool fast_math;
-  bool use_unified_memory;
-  bool async;
+  bool async_mode;
+  bool flatten_if;
+  bool make_thread_local;
+  bool make_block_local;
   DataType default_fp;
   DataType default_ip;
   std::string extra_flags;
   int default_cpu_block_dim;
   int default_gpu_block_dim;
+  int ad_stack_size;
 
+  int saturating_grid_dim;
+  int max_block_dim;
+  int cpu_max_num_threads;
+
+  // LLVM backend options:
+  bool print_struct_llvm_ir;
+  bool print_kernel_llvm_ir;
+  bool print_kernel_llvm_ir_optimized;
+  bool print_kernel_nvptx;
+
+  // CUDA backend options:
+  bool use_unified_memory;
   float64 device_memory_GB;
   float64 device_memory_fraction;
+
+  // C backend options:
+  std::string cc_compile_cmd;
+  std::string cc_link_cmd;
+
+  bool async_opt_fusion{true};
+  bool async_opt_listgen{true};
+  bool async_opt_activation_demotion{true};
+  bool async_opt_dse{true};
+  std::string async_opt_intermediate_file;
 
   CompileConfig();
 };

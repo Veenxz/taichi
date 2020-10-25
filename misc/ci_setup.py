@@ -19,8 +19,8 @@ assert struct.calcsize(
 ) * 8 == 64, "Only 64-bit platforms are supported. Current platform: {}".format(
     struct.calcsize('P') * 8)
 
-if sys.version_info[0] < 3 or sys.version_info[1] < 5:
-    print("\nPlease restart with python3. \n(Taichi supports Python 3.5+)\n")
+if sys.version_info[0] < 3 or sys.version_info[1] < 6:
+    print("\nPlease restart with python3. \n(Taichi supports Python 3.6+)\n")
     print("Current version:", sys.version_info)
     exit(-1)
 
@@ -185,11 +185,14 @@ class Installer:
             "GitPython",
             "yapf",
             "distro",
-            "pytest",
             "autograd",
             "astor",
+            "sourceinspect",
+            "pytest==6.0.2",
             "pytest-xdist",
             "pytest-rerunfailures",
+            "pytest-cov",
+            "coverage",
         ])
         print("importing numpy test:")
         ret = subprocess.run(
@@ -258,8 +261,9 @@ class Installer:
             # compile ..
             os.makedirs('build', exist_ok=True)
             arg = environ.get('CI_SETUP_CMAKE_ARGS', '')
-            execute_command('cd build && cmake .. -DTI_WITH_CUDA:BOOL=OFF ' +
-                            arg)
+            execute_command(
+                f'cd build && cmake .. -DPYTHON_EXECUTABLE={sys.executable} {arg}'
+            )
             execute_command('cd build && make -j 10')
         return
         if test_installation():

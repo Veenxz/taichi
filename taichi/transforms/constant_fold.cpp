@@ -1,21 +1,21 @@
-#include "taichi/ir/ir.h"
-#include "taichi/ir/transforms.h"
-#include "taichi/ir/visitors.h"
-#include "taichi/program/program.h"
+#include <cmath>
 #include <deque>
 #include <set>
-#include <cmath>
 #include <thread>
 
 #include "taichi/ir/ir.h"
-#include "taichi/program/program.h"
 #include "taichi/ir/snode.h"
+#include "taichi/ir/statements.h"
+#include "taichi/ir/transforms.h"
+#include "taichi/ir/visitors.h"
+#include "taichi/program/program.h"
 
 TLANG_NAMESPACE_BEGIN
 
 class ConstantFold : public BasicStmtVisitor {
  public:
   using BasicStmtVisitor::visit;
+  DelayedIRModifier modifier;
 
   ConstantFold() : BasicStmtVisitor() {
   }
@@ -33,9 +33,11 @@ class ConstantFold : public BasicStmtVisitor {
     }
 
     auto kernel_name = fmt::format("jit_evaluator_{}", cache.size());
-    auto func = [&]() {
-      auto lhstmt = Stmt::make<ArgLoadStmt>(0, false);
-      auto rhstmt = Stmt::make<ArgLoadStmt>(1, false);
+    auto func = [&id]() {
+      auto lhstmt =
+          Stmt::make<ArgLoadStmt>(/*arg_id=*/0, id.lhs, /*is_ptr=*/false);
+      auto rhstmt =
+          Stmt::make<ArgLoadStmt>(/*arg_id=*/1, id.rhs, /*is_ptr=*/false);
       pStmt oper;
       if (id.is_binary) {
         oper = Stmt::make<BinaryOpStmt>(id.binary_op(), lhstmt.get(),
@@ -46,7 +48,7 @@ class ConstantFold : public BasicStmtVisitor {
           oper->cast<UnaryOpStmt>()->cast_type = id.rhs;
         }
       }
-      auto ret = Stmt::make<KernelReturnStmt>(oper.get());
+      auto ret = Stmt::make<KernelReturnStmt>(oper.get(), id.ret);
       current_ast_builder().insert(std::move(lhstmt));
       if (id.is_binary)
         current_ast_builder().insert(std::move(rhstmt));
@@ -75,30 +77,14 @@ class ConstantFold : public BasicStmtVisitor {
     // ConstStmt of `bad` types like `i8` is not supported by LLVM.
     // Discussion:
     // https://github.com/taichi-dev/taichi/pull/839#issuecomment-625902727
-    switch (dt) {
-      case DataType::i32:
-      case DataType::f32:
-      case DataType::i64:
-      case DataType::f64:
-        return true;
-      default:
-        return false;
-    }
+    if (dt->is_primitive(PrimitiveTypeID::i32) ||
+        dt->is_primitive(PrimitiveTypeID::f32) ||
+        dt->is_primitive(PrimitiveTypeID::i64) ||
+        dt->is_primitive(PrimitiveTypeID::f64))
+      return true;
+    else
+      return false;
   }
-
-  class ContextArgSaveGuard {
-    Context &ctx;
-    uint64 old_args[taichi_max_num_args];
-
-   public:
-    explicit ContextArgSaveGuard(Context &ctx_) : ctx(ctx_) {
-      std::memcpy(old_args, ctx.args, sizeof(old_args));
-    }
-
-    ~ContextArgSaveGuard() {
-      std::memcpy(ctx.args, old_args, sizeof(old_args));
-    }
-  };
 
   static bool jit_evaluate_binary_op(TypedConstant &ret,
                                      BinaryOpStmt *stmt,
@@ -113,13 +99,11 @@ class ConstantFold : public BasicStmtVisitor {
                       rhs.dt,
                       true};
     auto *ker = get_jit_evaluator_kernel(id);
+    auto launch_ctx = ker->make_launch_context();
+    launch_ctx.set_arg_raw(0, lhs.val_u64);
+    launch_ctx.set_arg_raw(1, rhs.val_u64);
+    (*ker)(launch_ctx);
     auto &current_program = stmt->get_kernel()->program;
-    auto &ctx = current_program.get_context();
-    ContextArgSaveGuard _(
-        ctx);  // save input args, prevent override current kernel
-    ctx.set_arg<int64_t>(0, lhs.val_i64);
-    ctx.set_arg<int64_t>(1, rhs.val_i64);
-    (*ker)();
     ret.val_i64 = current_program.fetch_result<int64_t>(0);
     return true;
   }
@@ -136,12 +120,10 @@ class ConstantFold : public BasicStmtVisitor {
                       stmt->cast_type,
                       false};
     auto *ker = get_jit_evaluator_kernel(id);
+    auto launch_ctx = ker->make_launch_context();
+    launch_ctx.set_arg_raw(0, operand.val_u64);
+    (*ker)(launch_ctx);
     auto &current_program = stmt->get_kernel()->program;
-    auto &ctx = current_program.get_context();
-    ContextArgSaveGuard _(
-        ctx);  // save input args, prevent override current kernel
-    ctx.set_arg<int64_t>(0, operand.val_i64);
-    (*ker)();
     ret.val_i64 = current_program.fetch_result<int64_t>(0);
     return true;
   }
@@ -153,66 +135,93 @@ class ConstantFold : public BasicStmtVisitor {
       return;
     if (stmt->width() != 1)
       return;
-    auto dst_type = stmt->ret_type.data_type;
+    auto dst_type = stmt->ret_type;
     TypedConstant new_constant(dst_type);
     if (jit_evaluate_binary_op(new_constant, stmt, lhs->val[0], rhs->val[0])) {
       auto evaluated =
           Stmt::make<ConstStmt>(LaneAttribute<TypedConstant>(new_constant));
       stmt->replace_with(evaluated.get());
-      stmt->parent->insert_before(stmt, VecStatement(std::move(evaluated)));
-      stmt->parent->erase(stmt);
-      throw IRModified();
+      modifier.insert_before(stmt, std::move(evaluated));
+      modifier.erase(stmt);
     }
   }
 
   void visit(UnaryOpStmt *stmt) override {
+    if (stmt->is_cast() && stmt->cast_type == stmt->operand->ret_type) {
+      stmt->replace_with(stmt->operand);
+      modifier.erase(stmt);
+      return;
+    }
     auto operand = stmt->operand->cast<ConstStmt>();
     if (!operand)
       return;
     if (stmt->width() != 1)
       return;
-    auto dst_type = stmt->ret_type.data_type;
+    auto dst_type = stmt->ret_type;
     TypedConstant new_constant(dst_type);
     if (jit_evaluate_unary_op(new_constant, stmt, operand->val[0])) {
       auto evaluated =
           Stmt::make<ConstStmt>(LaneAttribute<TypedConstant>(new_constant));
       stmt->replace_with(evaluated.get());
-      stmt->parent->insert_before(stmt, VecStatement(std::move(evaluated)));
-      stmt->parent->erase(stmt);
-      throw IRModified();
+      modifier.insert_before(stmt, std::move(evaluated));
+      modifier.erase(stmt);
     }
   }
 
-  static void run(IRNode *node) {
-    ConstantFold folder;
-    while (true) {
-      bool modified = false;
-      try {
-        node->accept(&folder);
-      } catch (IRModified) {
-        modified = true;
-      }
-      if (!modified)
-        break;
+  void visit(BitExtractStmt *stmt) override {
+    auto input = stmt->input->cast<ConstStmt>();
+    if (!input)
+      return;
+    if (stmt->width() != 1)
+      return;
+    std::unique_ptr<Stmt> result_stmt;
+    if (is_signed(input->val[0].dt)) {
+      auto result = (input->val[0].val_int() >> stmt->bit_begin) &
+                    ((1LL << (stmt->bit_end - stmt->bit_begin)) - 1);
+      result_stmt = Stmt::make<ConstStmt>(LaneAttribute<TypedConstant>(
+          TypedConstant(input->val[0].dt, result)));
+    } else {
+      auto result = (input->val[0].val_uint() >> stmt->bit_begin) &
+                    ((1LL << (stmt->bit_end - stmt->bit_begin)) - 1);
+      result_stmt = Stmt::make<ConstStmt>(LaneAttribute<TypedConstant>(
+          TypedConstant(input->val[0].dt, result)));
     }
+    stmt->replace_with(result_stmt.get());
+    modifier.insert_before(stmt, std::move(result_stmt));
+    modifier.erase(stmt);
+  }
+
+  static bool run(IRNode *node) {
+    ConstantFold folder;
+    bool modified = false;
+    while (true) {
+      node->accept(&folder);
+      if (folder.modifier.modify_ir()) {
+        modified = true;
+      } else {
+        break;
+      }
+    }
+    return modified;
   }
 };
 
 namespace irpass {
 
-void constant_fold(IRNode *root) {
+bool constant_fold(IRNode *root) {
+  TI_AUTO_PROF;
+  const auto &cfg = root->get_config();
   // @archibate found that `debug=True` will cause JIT kernels
   // failed to evaluate correctly (always return 0), so we simply
   // disable constant_fold when config.debug is turned on.
   // Discussion:
   // https://github.com/taichi-dev/taichi/pull/839#issuecomment-626107010
-  auto kernel = root->get_kernel();
-  if (kernel && kernel->program.config.debug) {
+  if (cfg.debug) {
     TI_TRACE("config.debug enabled, ignoring constant fold");
-    return;
+    return false;
   }
-  if (!advanced_optimization)
-    return;
+  if (!cfg.advanced_optimization)
+    return false;
   return ConstantFold::run(root);
 }
 

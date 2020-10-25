@@ -1,6 +1,8 @@
-#include "codegen_llvm.h"
+#include "taichi/codegen/codegen_llvm.h"
 
+#include "taichi/ir/statements.h"
 #include "taichi/struct/struct_llvm.h"
+#include "taichi/util/file_sequence_writer.h"
 
 TLANG_NAMESPACE_BEGIN
 
@@ -43,22 +45,23 @@ FunctionCreationGuard::FunctionCreationGuard(
       llvm::Type::getVoidTy(*mb->llvm_context), arguments, false);
 
   body = llvm::Function::Create(body_function_type,
-                                llvm::Function::InternalLinkage, "loop_body",
-                                mb->module.get());
+                                llvm::Function::InternalLinkage,
+                                "function_body", mb->module.get());
   old_func = mb->func;
   // emit into loop body function
   mb->func = body;
 
-  allocas = BasicBlock::Create(*mb->llvm_context, "allocs", body);
+  allocas = llvm::BasicBlock::Create(*mb->llvm_context, "allocs", body);
   old_entry = mb->entry_block;
   mb->entry_block = allocas;
 
-  entry = BasicBlock::Create(*mb->llvm_context, "entry", mb->func);
+  entry = llvm::BasicBlock::Create(*mb->llvm_context, "entry", mb->func);
 
   ip = mb->builder->saveIP();
   mb->builder->SetInsertPoint(entry);
 
-  auto body_bb = BasicBlock::Create(*mb->llvm_context, "loop_body", mb->func);
+  auto body_bb =
+      llvm::BasicBlock::Create(*mb->llvm_context, "function_body", mb->func);
   mb->builder->CreateBr(body_bb);
   mb->builder->SetInsertPoint(body_bb);
 }
@@ -127,37 +130,39 @@ void CodeGenLLVM::visit(Block *stmt_list) {
 
 void CodeGenLLVM::visit(AllocaStmt *stmt) {
   TI_ASSERT(stmt->width() == 1);
-  llvm_val[stmt] = create_entry_block_alloca(stmt->ret_type.data_type);
-  // initialize as zero
-  builder->CreateStore(tlctx->get_constant(stmt->ret_type.data_type, 0),
-                       llvm_val[stmt]);
+  llvm_val[stmt] =
+      create_entry_block_alloca(stmt->ret_type, stmt->ret_type.is_pointer());
+  // initialize as zero if element is not a pointer
+  if (!stmt->ret_type.is_pointer())
+    builder->CreateStore(tlctx->get_constant(stmt->ret_type, 0),
+                         llvm_val[stmt]);
 }
 
 void CodeGenLLVM::visit(RandStmt *stmt) {
-  llvm_val[stmt] = create_call(
-      fmt::format("rand_{}", data_type_short_name(stmt->ret_type.data_type)));
+  llvm_val[stmt] =
+      create_call(fmt::format("rand_{}", data_type_short_name(stmt->ret_type)));
 }
 
 void CodeGenLLVM::emit_extra_unary(UnaryOpStmt *stmt) {
   auto input = llvm_val[stmt->operand];
-  auto input_taichi_type = stmt->operand->ret_type.data_type;
+  auto input_taichi_type = stmt->operand->ret_type;
   auto op = stmt->op_type;
   auto input_type = input->getType();
 
-#define UNARY_STD(x)                                                   \
-  else if (op == UnaryOpType::x) {                                     \
-    if (input_taichi_type == DataType::f32) {                          \
-      llvm_val[stmt] =                                                 \
-          builder->CreateCall(get_runtime_function(#x "_f32"), input); \
-    } else if (input_taichi_type == DataType::f64) {                   \
-      llvm_val[stmt] =                                                 \
-          builder->CreateCall(get_runtime_function(#x "_f64"), input); \
-    } else if (input_taichi_type == DataType::i32) {                   \
-      llvm_val[stmt] =                                                 \
-          builder->CreateCall(get_runtime_function(#x "_i32"), input); \
-    } else {                                                           \
-      TI_NOT_IMPLEMENTED                                               \
-    }                                                                  \
+#define UNARY_STD(x)                                                    \
+  else if (op == UnaryOpType::x) {                                      \
+    if (input_taichi_type->is_primitive(PrimitiveTypeID::f32)) {        \
+      llvm_val[stmt] =                                                  \
+          builder->CreateCall(get_runtime_function(#x "_f32"), input);  \
+    } else if (input_taichi_type->is_primitive(PrimitiveTypeID::f64)) { \
+      llvm_val[stmt] =                                                  \
+          builder->CreateCall(get_runtime_function(#x "_f64"), input);  \
+    } else if (input_taichi_type->is_primitive(PrimitiveTypeID::i32)) { \
+      llvm_val[stmt] =                                                  \
+          builder->CreateCall(get_runtime_function(#x "_i32"), input);  \
+    } else {                                                            \
+      TI_NOT_IMPLEMENTED                                                \
+    }                                                                   \
   }
   if (false) {
   }
@@ -293,7 +298,7 @@ void CodeGenLLVM::visit(UnaryOpStmt *stmt) {
   }
   if (stmt->op_type == UnaryOpType::cast_value) {
     llvm::CastInst::CastOps cast_op;
-    auto from = stmt->operand->ret_type.data_type;
+    auto from = stmt->operand->ret_type;
     auto to = stmt->cast_type;
     TI_ASSERT(from != to);
     if (is_real(from) != is_real(to)) {
@@ -327,20 +332,20 @@ void CodeGenLLVM::visit(UnaryOpStmt *stmt) {
       }
     }
   } else if (stmt->op_type == UnaryOpType::cast_bits) {
-    TI_ASSERT(data_type_size(stmt->ret_type.data_type) ==
+    TI_ASSERT(data_type_size(stmt->ret_type) ==
               data_type_size(stmt->cast_type));
     llvm_val[stmt] = builder->CreateBitCast(
         llvm_val[stmt->operand], tlctx->get_data_type(stmt->cast_type));
   } else if (op == UnaryOpType::rsqrt) {
-    llvm::Function *sqrt_fn = Intrinsic::getDeclaration(
-        module.get(), Intrinsic::sqrt, input->getType());
+    llvm::Function *sqrt_fn = llvm::Intrinsic::getDeclaration(
+        module.get(), llvm::Intrinsic::sqrt, input->getType());
     auto intermediate = builder->CreateCall(sqrt_fn, input, "sqrt");
     llvm_val[stmt] = builder->CreateFDiv(
-        tlctx->get_constant(stmt->ret_type.data_type, 1.0), intermediate);
+        tlctx->get_constant(stmt->ret_type, 1.0), intermediate);
   } else if (op == UnaryOpType::bit_not) {
     llvm_val[stmt] = builder->CreateNot(input);
   } else if (op == UnaryOpType::neg) {
-    if (is_real(stmt->operand->ret_type.data_type)) {
+    if (is_real(stmt->operand->ret_type)) {
       llvm_val[stmt] = builder->CreateFNeg(input, "neg");
     } else {
       llvm_val[stmt] = builder->CreateNeg(input, "neg");
@@ -354,9 +359,9 @@ void CodeGenLLVM::visit(UnaryOpStmt *stmt) {
 
 void CodeGenLLVM::visit(BinaryOpStmt *stmt) {
   auto op = stmt->op_type;
-  auto ret_type = stmt->ret_type.data_type;
+  auto ret_type = stmt->ret_type;
   if (op == BinaryOpType::add) {
-    if (is_real(stmt->ret_type.data_type)) {
+    if (is_real(stmt->ret_type)) {
       llvm_val[stmt] =
           builder->CreateFAdd(llvm_val[stmt->lhs], llvm_val[stmt->rhs]);
     } else {
@@ -364,7 +369,7 @@ void CodeGenLLVM::visit(BinaryOpStmt *stmt) {
           builder->CreateAdd(llvm_val[stmt->lhs], llvm_val[stmt->rhs]);
     }
   } else if (op == BinaryOpType::sub) {
-    if (is_real(stmt->ret_type.data_type)) {
+    if (is_real(stmt->ret_type)) {
       llvm_val[stmt] =
           builder->CreateFSub(llvm_val[stmt->lhs], llvm_val[stmt->rhs]);
     } else {
@@ -372,7 +377,7 @@ void CodeGenLLVM::visit(BinaryOpStmt *stmt) {
           builder->CreateSub(llvm_val[stmt->lhs], llvm_val[stmt->rhs]);
     }
   } else if (op == BinaryOpType::mul) {
-    if (is_real(stmt->ret_type.data_type)) {
+    if (is_real(stmt->ret_type)) {
       llvm_val[stmt] =
           builder->CreateFMul(llvm_val[stmt->lhs], llvm_val[stmt->rhs]);
     } else {
@@ -390,7 +395,7 @@ void CodeGenLLVM::visit(BinaryOpStmt *stmt) {
           llvm::Intrinsic::floor, {tlctx->get_data_type(ret_type)}, {div});
     }
   } else if (op == BinaryOpType::div) {
-    if (is_real(stmt->ret_type.data_type)) {
+    if (is_real(stmt->ret_type)) {
       llvm_val[stmt] =
           builder->CreateFDiv(llvm_val[stmt->lhs], llvm_val[stmt->rhs]);
     } else {
@@ -409,11 +414,22 @@ void CodeGenLLVM::visit(BinaryOpStmt *stmt) {
   } else if (op == BinaryOpType::bit_xor) {
     llvm_val[stmt] =
         builder->CreateXor(llvm_val[stmt->lhs], llvm_val[stmt->rhs]);
+  } else if (op == BinaryOpType::bit_shl) {
+    llvm_val[stmt] =
+        builder->CreateShl(llvm_val[stmt->lhs], llvm_val[stmt->rhs]);
+  } else if (op == BinaryOpType::bit_sar) {
+    if (is_signed(stmt->lhs->element_type())) {
+      llvm_val[stmt] =
+          builder->CreateAShr(llvm_val[stmt->lhs], llvm_val[stmt->rhs]);
+    } else {
+      llvm_val[stmt] =
+          builder->CreateLShr(llvm_val[stmt->lhs], llvm_val[stmt->rhs]);
+    }
   } else if (op == BinaryOpType::max) {
     if (is_real(ret_type)) {
       llvm_val[stmt] =
           builder->CreateMaxNum(llvm_val[stmt->lhs], llvm_val[stmt->rhs]);
-    } else if (ret_type == DataType::i32) {
+    } else if (ret_type->is_primitive(PrimitiveTypeID::i32)) {
       llvm_val[stmt] =
           create_call("max_i32", {llvm_val[stmt->lhs], llvm_val[stmt->rhs]});
     } else {
@@ -422,10 +438,10 @@ void CodeGenLLVM::visit(BinaryOpStmt *stmt) {
     }
   } else if (op == BinaryOpType::atan2) {
     if (arch_is_cpu(current_arch())) {
-      if (ret_type == DataType::f32) {
+      if (ret_type->is_primitive(PrimitiveTypeID::f32)) {
         llvm_val[stmt] = create_call(
             "atan2_f32", {llvm_val[stmt->lhs], llvm_val[stmt->rhs]});
-      } else if (ret_type == DataType::f64) {
+      } else if (ret_type->is_primitive(PrimitiveTypeID::f64)) {
         llvm_val[stmt] = create_call(
             "atan2_f64", {llvm_val[stmt->lhs], llvm_val[stmt->rhs]});
       } else {
@@ -433,10 +449,10 @@ void CodeGenLLVM::visit(BinaryOpStmt *stmt) {
         TI_NOT_IMPLEMENTED
       }
     } else if (current_arch() == Arch::cuda) {
-      if (ret_type == DataType::f32) {
+      if (ret_type->is_primitive(PrimitiveTypeID::f32)) {
         llvm_val[stmt] = create_call(
             "__nv_atan2f", {llvm_val[stmt->lhs], llvm_val[stmt->rhs]});
-      } else if (ret_type == DataType::f64) {
+      } else if (ret_type->is_primitive(PrimitiveTypeID::f64)) {
         llvm_val[stmt] = create_call(
             "__nv_atan2", {llvm_val[stmt->lhs], llvm_val[stmt->rhs]});
       } else {
@@ -448,16 +464,16 @@ void CodeGenLLVM::visit(BinaryOpStmt *stmt) {
     }
   } else if (op == BinaryOpType::pow) {
     if (arch_is_cpu(current_arch())) {
-      if (ret_type == DataType::f32) {
+      if (ret_type->is_primitive(PrimitiveTypeID::f32)) {
         llvm_val[stmt] =
             create_call("pow_f32", {llvm_val[stmt->lhs], llvm_val[stmt->rhs]});
-      } else if (ret_type == DataType::f64) {
+      } else if (ret_type->is_primitive(PrimitiveTypeID::f64)) {
         llvm_val[stmt] =
             create_call("pow_f64", {llvm_val[stmt->lhs], llvm_val[stmt->rhs]});
-      } else if (ret_type == DataType::i32) {
+      } else if (ret_type->is_primitive(PrimitiveTypeID::i32)) {
         llvm_val[stmt] =
             create_call("pow_i32", {llvm_val[stmt->lhs], llvm_val[stmt->rhs]});
-      } else if (ret_type == DataType::i64) {
+      } else if (ret_type->is_primitive(PrimitiveTypeID::i64)) {
         llvm_val[stmt] =
             create_call("pow_i64", {llvm_val[stmt->lhs], llvm_val[stmt->rhs]});
       } else {
@@ -465,16 +481,16 @@ void CodeGenLLVM::visit(BinaryOpStmt *stmt) {
         TI_NOT_IMPLEMENTED
       }
     } else if (current_arch() == Arch::cuda) {
-      if (ret_type == DataType::f32) {
+      if (ret_type->is_primitive(PrimitiveTypeID::f32)) {
         llvm_val[stmt] = create_call(
             "__nv_powf", {llvm_val[stmt->lhs], llvm_val[stmt->rhs]});
-      } else if (ret_type == DataType::f64) {
+      } else if (ret_type->is_primitive(PrimitiveTypeID::f64)) {
         llvm_val[stmt] =
             create_call("__nv_pow", {llvm_val[stmt->lhs], llvm_val[stmt->rhs]});
-      } else if (ret_type == DataType::i32) {
+      } else if (ret_type->is_primitive(PrimitiveTypeID::i32)) {
         llvm_val[stmt] =
             create_call("pow_i32", {llvm_val[stmt->lhs], llvm_val[stmt->rhs]});
-      } else if (ret_type == DataType::i64) {
+      } else if (ret_type->is_primitive(PrimitiveTypeID::i64)) {
         llvm_val[stmt] =
             create_call("pow_i64", {llvm_val[stmt->lhs], llvm_val[stmt->rhs]});
       } else {
@@ -488,7 +504,7 @@ void CodeGenLLVM::visit(BinaryOpStmt *stmt) {
     if (is_real(ret_type)) {
       llvm_val[stmt] =
           builder->CreateMinNum(llvm_val[stmt->lhs], llvm_val[stmt->rhs]);
-    } else if (ret_type == DataType::i32) {
+    } else if (ret_type->is_primitive(PrimitiveTypeID::i32)) {
       llvm_val[stmt] =
           create_call("min_i32", {llvm_val[stmt->lhs], llvm_val[stmt->rhs]});
     } else {
@@ -497,7 +513,7 @@ void CodeGenLLVM::visit(BinaryOpStmt *stmt) {
     }
   } else if (is_comparison(op)) {
     llvm::Value *cmp = nullptr;
-    auto input_type = stmt->lhs->ret_type.data_type;
+    auto input_type = stmt->lhs->ret_type;
     if (op == BinaryOpType::cmp_eq) {
       if (is_real(input_type)) {
         cmp = builder->CreateFCmpOEQ(llvm_val[stmt->lhs], llvm_val[stmt->rhs]);
@@ -561,7 +577,7 @@ void CodeGenLLVM::visit(BinaryOpStmt *stmt) {
     } else {
       TI_NOT_IMPLEMENTED
     }
-    llvm_val[stmt] = builder->CreateSExt(cmp, llvm_type(DataType::i32));
+    llvm_val[stmt] = builder->CreateSExt(cmp, llvm_type(PrimitiveType::i32));
   } else {
     TI_P(binary_op_type_name(op));
     TI_NOT_IMPLEMENTED
@@ -569,13 +585,13 @@ void CodeGenLLVM::visit(BinaryOpStmt *stmt) {
 }
 
 llvm::Type *CodeGenLLVM::llvm_type(DataType dt) {
-  if (dt == DataType::i32) {
+  if (dt->is_primitive(PrimitiveTypeID::i32)) {
     return llvm::Type::getInt32Ty(*llvm_context);
-  } else if (dt == DataType::u1) {
+  } else if (dt->is_primitive(PrimitiveTypeID::u1)) {
     return llvm::Type::getInt1Ty(*llvm_context);
-  } else if (dt == DataType::f32) {
+  } else if (dt->is_primitive(PrimitiveTypeID::f32)) {
     return llvm::Type::getFloatTy(*llvm_context);
-  } else if (dt == DataType::f64) {
+  } else if (dt->is_primitive(PrimitiveTypeID::f64)) {
     return llvm::Type::getDoubleTy(*llvm_context);
   } else {
     TI_NOT_IMPLEMENTED;
@@ -586,17 +602,18 @@ llvm::Type *CodeGenLLVM::llvm_type(DataType dt) {
 void CodeGenLLVM::visit(TernaryOpStmt *stmt) {
   TI_ASSERT(stmt->op_type == TernaryOpType::select);
   llvm_val[stmt] = builder->CreateSelect(
-      builder->CreateTrunc(llvm_val[stmt->op1], llvm_type(DataType::u1)),
+      builder->CreateTrunc(llvm_val[stmt->op1], llvm_type(PrimitiveType::u1)),
       llvm_val[stmt->op2], llvm_val[stmt->op3]);
 }
 
 void CodeGenLLVM::visit(IfStmt *if_stmt) {
   // TODO: take care of vectorized cases
-  BasicBlock *true_block =
-      BasicBlock::Create(*llvm_context, "true_block", func);
-  BasicBlock *false_block =
-      BasicBlock::Create(*llvm_context, "false_block", func);
-  BasicBlock *after_if = BasicBlock::Create(*llvm_context, "after_if", func);
+  llvm::BasicBlock *true_block =
+      llvm::BasicBlock::Create(*llvm_context, "true_block", func);
+  llvm::BasicBlock *false_block =
+      llvm::BasicBlock::Create(*llvm_context, "false_block", func);
+  llvm::BasicBlock *after_if =
+      llvm::BasicBlock::Create(*llvm_context, "after_if", func);
   builder->CreateCondBr(
       builder->CreateICmpNE(llvm_val[if_stmt->cond], tlctx->get_constant(0)),
       true_block, false_block);
@@ -617,31 +634,32 @@ llvm::Value *CodeGenLLVM::create_print(std::string tag,
                                        DataType dt,
                                        llvm::Value *value) {
   TI_ASSERT(arch_use_host_memory(kernel->arch));
-  std::vector<Value *> args;
+  std::vector<llvm::Value *> args;
   std::string format = data_type_format(dt);
   auto runtime_printf = call("LLVMRuntime_get_host_printf", get_runtime());
   args.push_back(builder->CreateGlobalStringPtr(
       ("[llvm codegen debug] " + tag + " = " + format + "\n").c_str(),
       "format_string"));
-  if (dt == DataType::f32)
-    value = builder->CreateFPExt(value, tlctx->get_data_type(DataType::f64));
+  if (dt->is_primitive(PrimitiveTypeID::f32))
+    value =
+        builder->CreateFPExt(value, tlctx->get_data_type(PrimitiveType::f64));
   args.push_back(value);
   return builder->CreateCall(runtime_printf, args);
 }
 
 void CodeGenLLVM::visit(PrintStmt *stmt) {
   TI_ASSERT(stmt->width() == 1);
-  std::vector<Value *> args;
+  std::vector<llvm::Value *> args;
   std::string formats;
   for (auto const &content : stmt->contents) {
     if (std::holds_alternative<Stmt *>(content)) {
       auto arg_stmt = std::get<Stmt *>(content);
       auto value = llvm_val[arg_stmt];
-      if (arg_stmt->ret_type.data_type == DataType::f32)
-        value =
-            builder->CreateFPExt(value, tlctx->get_data_type(DataType::f64));
+      if (arg_stmt->ret_type->is_primitive(PrimitiveTypeID::f32))
+        value = builder->CreateFPExt(value,
+                                     tlctx->get_data_type(PrimitiveType::f64));
       args.push_back(value);
-      formats += data_type_format(arg_stmt->ret_type.data_type);
+      formats += data_type_format(arg_stmt->ret_type);
     } else {
       auto arg_str = std::get<std::string>(content);
       auto value = builder->CreateGlobalStringPtr(arg_str, "content_string");
@@ -650,8 +668,8 @@ void CodeGenLLVM::visit(PrintStmt *stmt) {
     }
   }
   auto runtime_printf = call("LLVMRuntime_get_host_printf", get_runtime());
-  args.insert(args.begin(), builder->CreateGlobalStringPtr(
-                                (formats + "\n").c_str(), "format_string"));
+  args.insert(args.begin(),
+              builder->CreateGlobalStringPtr(formats.c_str(), "format_string"));
 
   llvm_val[stmt] = builder->CreateCall(runtime_printf, args);
 }
@@ -659,18 +677,24 @@ void CodeGenLLVM::visit(PrintStmt *stmt) {
 void CodeGenLLVM::visit(ConstStmt *stmt) {
   TI_ASSERT(stmt->width() == 1);
   auto val = stmt->val[0];
-  if (val.dt == DataType::f32) {
+  if (val.dt->is_primitive(PrimitiveTypeID::f32)) {
     llvm_val[stmt] =
         llvm::ConstantFP::get(*llvm_context, llvm::APFloat(val.val_float32()));
-  } else if (val.dt == DataType::f64) {
+  } else if (val.dt->is_primitive(PrimitiveTypeID::f64)) {
     llvm_val[stmt] =
         llvm::ConstantFP::get(*llvm_context, llvm::APFloat(val.val_float64()));
-  } else if (val.dt == DataType::i32) {
+  } else if (val.dt->is_primitive(PrimitiveTypeID::i32)) {
     llvm_val[stmt] = llvm::ConstantInt::get(
-        *llvm_context, llvm::APInt(32, val.val_int32(), true));
-  } else if (val.dt == DataType::i64) {
+        *llvm_context, llvm::APInt(32, (uint64)val.val_int32(), true));
+  } else if (val.dt->is_primitive(PrimitiveTypeID::u32)) {
     llvm_val[stmt] = llvm::ConstantInt::get(
-        *llvm_context, llvm::APInt(64, val.val_int64(), true));
+        *llvm_context, llvm::APInt(32, (uint64)val.val_uint32(), false));
+  } else if (val.dt->is_primitive(PrimitiveTypeID::i64)) {
+    llvm_val[stmt] = llvm::ConstantInt::get(
+        *llvm_context, llvm::APInt(64, (uint64)val.val_int64(), true));
+  } else if (val.dt->is_primitive(PrimitiveTypeID::u64)) {
+    llvm_val[stmt] = llvm::ConstantInt::get(
+        *llvm_context, llvm::APInt(64, val.val_uint64(), false));
   } else {
     TI_P(data_type_name(val.dt));
     TI_NOT_IMPLEMENTED;
@@ -678,6 +702,8 @@ void CodeGenLLVM::visit(ConstStmt *stmt) {
 }
 
 void CodeGenLLVM::visit(WhileControlStmt *stmt) {
+  using namespace llvm;
+
   BasicBlock *after_break =
       BasicBlock::Create(*llvm_context, "after_break", func);
   TI_ASSERT(current_while_after_loop);
@@ -688,6 +714,7 @@ void CodeGenLLVM::visit(WhileControlStmt *stmt) {
 }
 
 void CodeGenLLVM::visit(ContinueStmt *stmt) {
+  using namespace llvm;
   if (stmt->as_return()) {
     builder->CreateRetVoid();
   } else {
@@ -702,6 +729,7 @@ void CodeGenLLVM::visit(ContinueStmt *stmt) {
 }
 
 void CodeGenLLVM::visit(WhileStmt *stmt) {
+  using namespace llvm;
   BasicBlock *body = BasicBlock::Create(*llvm_context, "while_loop_body", func);
   builder->CreateBr(body);
   builder->SetInsertPoint(body);
@@ -727,20 +755,18 @@ llvm::Value *CodeGenLLVM::cast_pointer(llvm::Value *val,
       val, llvm::PointerType::get(get_runtime_type(dest_ty_name), addr_space));
 }
 
-void CodeGenLLVM::emit_clear_list(OffloadedStmt *listgen) {
-  auto snode_child = listgen->snode;
-  auto snode_parent = listgen->snode->parent;
-  auto meta_child = cast_pointer(emit_struct_meta(snode_child), "StructMeta");
-  auto meta_parent = cast_pointer(emit_struct_meta(snode_parent), "StructMeta");
-  call("clear_list", get_runtime(), meta_parent, meta_child);
-}
-
 void CodeGenLLVM::emit_list_gen(OffloadedStmt *listgen) {
   auto snode_child = listgen->snode;
   auto snode_parent = listgen->snode->parent;
   auto meta_child = cast_pointer(emit_struct_meta(snode_child), "StructMeta");
   auto meta_parent = cast_pointer(emit_struct_meta(snode_parent), "StructMeta");
-  call("element_listgen", get_runtime(), meta_parent, meta_child);
+  if (snode_parent->type == SNodeType::root) {
+    // Since there's only one container to expand, we need a special kernel for
+    // more parallelism.
+    call("element_listgen_root", get_runtime(), meta_parent, meta_child);
+  } else {
+    call("element_listgen_nonroot", get_runtime(), meta_parent, meta_child);
+  }
 }
 
 void CodeGenLLVM::emit_gc(OffloadedStmt *stmt) {
@@ -765,6 +791,7 @@ void CodeGenLLVM::create_increment(llvm::Value *ptr, llvm::Value *value) {
 }
 
 void CodeGenLLVM::create_naive_range_for(RangeForStmt *for_stmt) {
+  using namespace llvm;
   BasicBlock *body = BasicBlock::Create(*llvm_context, "for_loop_body", func);
   BasicBlock *loop_inc =
       BasicBlock::Create(*llvm_context, "for_loop_inc", func);
@@ -772,7 +799,7 @@ void CodeGenLLVM::create_naive_range_for(RangeForStmt *for_stmt) {
   BasicBlock *loop_test =
       BasicBlock::Create(*llvm_context, "for_loop_test", func);
 
-  auto loop_var = create_entry_block_alloca(DataType::i32);
+  auto loop_var = create_entry_block_alloca(PrimitiveType::i32);
   loop_vars_llvm[for_stmt].push_back(loop_var);
 
   if (!for_stmt->reversed) {
@@ -836,24 +863,25 @@ void CodeGenLLVM::visit(ArgLoadStmt *stmt) {
 
   llvm::Type *dest_ty = nullptr;
   if (stmt->is_ptr) {
-    dest_ty = PointerType::get(tlctx->get_data_type(DataType::i32), 0);
+    dest_ty =
+        llvm::PointerType::get(tlctx->get_data_type(PrimitiveType::i32), 0);
     llvm_val[stmt] = builder->CreateIntToPtr(raw_arg, dest_ty);
   } else {
-    dest_ty = tlctx->get_data_type(stmt->ret_type.data_type);
+    TI_ASSERT(!stmt->ret_type->is<PointerType>());
+    dest_ty = tlctx->get_data_type(stmt->ret_type);
     auto dest_bits = dest_ty->getPrimitiveSizeInBits();
     auto truncated = builder->CreateTrunc(
-        raw_arg, Type::getIntNTy(*llvm_context, dest_bits));
+        raw_arg, llvm::Type::getIntNTy(*llvm_context, dest_bits));
     llvm_val[stmt] = builder->CreateBitCast(truncated, dest_ty);
   }
 }
 
 void CodeGenLLVM::visit(KernelReturnStmt *stmt) {
-  if (stmt->is_ptr) {
+  if (stmt->ret_type.is_pointer()) {
     TI_NOT_IMPLEMENTED
   } else {
     auto intermediate_bits =
-        tlctx->get_data_type(stmt->value->ret_type.data_type)
-            ->getPrimitiveSizeInBits();
+        tlctx->get_data_type(stmt->value->ret_type)->getPrimitiveSizeInBits();
     llvm::Type *intermediate_type =
         llvm::Type::getIntNTy(*llvm_context, intermediate_bits);
     llvm::Type *dest_ty = tlctx->get_data_type<int64>();
@@ -880,27 +908,50 @@ void CodeGenLLVM::visit(LocalStoreStmt *stmt) {
 }
 
 void CodeGenLLVM::visit(AssertStmt *stmt) {
-  if (stmt->args.empty()) {
-    llvm_val[stmt] = call("taichi_assert", get_context(), llvm_val[stmt->cond],
-                          builder->CreateGlobalStringPtr(stmt->text));
-  } else {
-    std::vector<Value *> args;
-    args.emplace_back(get_runtime());
-    args.emplace_back(llvm_val[stmt->cond]);
-    args.emplace_back(builder->CreateGlobalStringPtr(stmt->text));
-    for (auto arg : stmt->args) {
-      TI_ASSERT(llvm_val[arg]);
-      args.emplace_back(llvm_val[arg]);
-    }
-    llvm_val[stmt] = create_call("taichi_assert_format", args);
+  TI_ASSERT((int)stmt->args.size() <= taichi_error_message_max_num_arguments);
+  auto argument_buffer_size = llvm::ArrayType::get(
+      llvm::Type::getInt64Ty(*llvm_context), stmt->args.size());
+
+  // TODO: maybe let all asserts in a single offload share a single buffer?
+  auto arguments = create_entry_block_alloca(argument_buffer_size);
+
+  std::vector<llvm::Value *> args;
+  args.emplace_back(get_runtime());
+  args.emplace_back(llvm_val[stmt->cond]);
+  args.emplace_back(builder->CreateGlobalStringPtr(stmt->text));
+
+  for (int i = 0; i < stmt->args.size(); i++) {
+    auto arg = stmt->args[i];
+    TI_ASSERT(llvm_val[arg]);
+
+    // First convert the argument to an integral type with the same number of
+    // bits:
+    auto cast_type = llvm::Type::getIntNTy(
+        *llvm_context, 8 * (std::size_t)data_type_size(arg->ret_type));
+    auto cast_int = builder->CreateBitCast(llvm_val[arg], cast_type);
+
+    // Then zero-extend the conversion result into int64:
+    auto cast_int64 =
+        builder->CreateZExt(cast_int, llvm::Type::getInt64Ty(*llvm_context));
+
+    // Finally store the int64 value to the argument buffer:
+    builder->CreateStore(
+        cast_int64, builder->CreateGEP(arguments, {tlctx->get_constant(0),
+                                                   tlctx->get_constant(i)}));
   }
+
+  args.emplace_back(tlctx->get_constant((int)stmt->args.size()));
+  args.emplace_back(builder->CreateGEP(
+      arguments, {tlctx->get_constant(0), tlctx->get_constant(0)}));
+
+  llvm_val[stmt] = create_call("taichi_assert_format", args);
 }
 
 void CodeGenLLVM::visit(SNodeOpStmt *stmt) {
   auto snode = stmt->snode;
   if (stmt->op_type == SNodeOpType::append) {
     TI_ASSERT(snode->type == SNodeType::dynamic);
-    TI_ASSERT(stmt->ret_type.data_type == DataType::i32);
+    TI_ASSERT(stmt->ret_type->is_primitive(PrimitiveTypeID::i32));
     llvm_val[stmt] =
         call(snode, llvm_val[stmt->ptr], "append", {llvm_val[stmt->val]});
   } else if (stmt->op_type == SNodeOpType::length) {
@@ -909,6 +960,9 @@ void CodeGenLLVM::visit(SNodeOpStmt *stmt) {
   } else if (stmt->op_type == SNodeOpType::is_active) {
     llvm_val[stmt] =
         call(snode, llvm_val[stmt->ptr], "is_active", {llvm_val[stmt->val]});
+  } else if (stmt->op_type == SNodeOpType::activate) {
+    llvm_val[stmt] =
+        call(snode, llvm_val[stmt->ptr], "activate", {llvm_val[stmt->val]});
   } else if (stmt->op_type == SNodeOpType::deactivate) {
     if (snode->type == SNodeType::pointer || snode->type == SNodeType::hash ||
         snode->type == SNodeType::bitmasked) {
@@ -929,15 +983,15 @@ void CodeGenLLVM::visit(AtomicOpStmt *stmt) {
   for (int l = 0; l < stmt->width(); l++) {
     llvm::Value *old_value;
     if (stmt->op_type == AtomicOpType::add) {
-      if (is_integral(stmt->val->ret_type.data_type)) {
+      if (is_integral(stmt->val->ret_type)) {
         old_value = builder->CreateAtomicRMW(
             llvm::AtomicRMWInst::BinOp::Add, llvm_val[stmt->dest],
             llvm_val[stmt->val], llvm::AtomicOrdering::SequentiallyConsistent);
-      } else if (stmt->val->ret_type.data_type == DataType::f32) {
+      } else if (stmt->val->ret_type->is_primitive(PrimitiveTypeID::f32)) {
         old_value =
             builder->CreateCall(get_runtime_function("atomic_add_f32"),
                                 {llvm_val[stmt->dest], llvm_val[stmt->val]});
-      } else if (stmt->val->ret_type.data_type == DataType::f64) {
+      } else if (stmt->val->ret_type->is_primitive(PrimitiveTypeID::f64)) {
         old_value =
             builder->CreateCall(get_runtime_function("atomic_add_f64"),
                                 {llvm_val[stmt->dest], llvm_val[stmt->val]});
@@ -945,15 +999,15 @@ void CodeGenLLVM::visit(AtomicOpStmt *stmt) {
         TI_NOT_IMPLEMENTED
       }
     } else if (stmt->op_type == AtomicOpType::min) {
-      if (is_integral(stmt->val->ret_type.data_type)) {
+      if (is_integral(stmt->val->ret_type)) {
         old_value = builder->CreateAtomicRMW(
             llvm::AtomicRMWInst::BinOp::Min, llvm_val[stmt->dest],
             llvm_val[stmt->val], llvm::AtomicOrdering::SequentiallyConsistent);
-      } else if (stmt->val->ret_type.data_type == DataType::f32) {
+      } else if (stmt->val->ret_type->is_primitive(PrimitiveTypeID::f32)) {
         old_value =
             builder->CreateCall(get_runtime_function("atomic_min_f32"),
                                 {llvm_val[stmt->dest], llvm_val[stmt->val]});
-      } else if (stmt->val->ret_type.data_type == DataType::f64) {
+      } else if (stmt->val->ret_type->is_primitive(PrimitiveTypeID::f64)) {
         old_value =
             builder->CreateCall(get_runtime_function("atomic_min_f64"),
                                 {llvm_val[stmt->dest], llvm_val[stmt->val]});
@@ -961,15 +1015,15 @@ void CodeGenLLVM::visit(AtomicOpStmt *stmt) {
         TI_NOT_IMPLEMENTED
       }
     } else if (stmt->op_type == AtomicOpType::max) {
-      if (is_integral(stmt->val->ret_type.data_type)) {
+      if (is_integral(stmt->val->ret_type)) {
         old_value = builder->CreateAtomicRMW(
             llvm::AtomicRMWInst::BinOp::Max, llvm_val[stmt->dest],
             llvm_val[stmt->val], llvm::AtomicOrdering::SequentiallyConsistent);
-      } else if (stmt->val->ret_type.data_type == DataType::f32) {
+      } else if (stmt->val->ret_type->is_primitive(PrimitiveTypeID::f32)) {
         old_value =
             builder->CreateCall(get_runtime_function("atomic_max_f32"),
                                 {llvm_val[stmt->dest], llvm_val[stmt->val]});
-      } else if (stmt->val->ret_type.data_type == DataType::f64) {
+      } else if (stmt->val->ret_type->is_primitive(PrimitiveTypeID::f64)) {
         old_value =
             builder->CreateCall(get_runtime_function("atomic_max_f64"),
                                 {llvm_val[stmt->dest], llvm_val[stmt->val]});
@@ -977,7 +1031,7 @@ void CodeGenLLVM::visit(AtomicOpStmt *stmt) {
         TI_NOT_IMPLEMENTED
       }
     } else if (stmt->op_type == AtomicOpType::bit_and) {
-      if (is_integral(stmt->val->ret_type.data_type)) {
+      if (is_integral(stmt->val->ret_type)) {
         old_value = builder->CreateAtomicRMW(
             llvm::AtomicRMWInst::BinOp::And, llvm_val[stmt->dest],
             llvm_val[stmt->val], llvm::AtomicOrdering::SequentiallyConsistent);
@@ -985,7 +1039,7 @@ void CodeGenLLVM::visit(AtomicOpStmt *stmt) {
         TI_NOT_IMPLEMENTED
       }
     } else if (stmt->op_type == AtomicOpType::bit_or) {
-      if (is_integral(stmt->val->ret_type.data_type)) {
+      if (is_integral(stmt->val->ret_type)) {
         old_value = builder->CreateAtomicRMW(
             llvm::AtomicRMWInst::BinOp::Or, llvm_val[stmt->dest],
             llvm_val[stmt->val], llvm::AtomicOrdering::SequentiallyConsistent);
@@ -993,7 +1047,7 @@ void CodeGenLLVM::visit(AtomicOpStmt *stmt) {
         TI_NOT_IMPLEMENTED
       }
     } else if (stmt->op_type == AtomicOpType::bit_xor) {
-      if (is_integral(stmt->val->ret_type.data_type)) {
+      if (is_integral(stmt->val->ret_type)) {
         old_value = builder->CreateAtomicRMW(
             llvm::AtomicRMWInst::BinOp::Xor, llvm_val[stmt->dest],
             llvm_val[stmt->val], llvm::AtomicOrdering::SequentiallyConsistent);
@@ -1021,8 +1075,8 @@ void CodeGenLLVM::visit(GlobalStoreStmt *stmt) {
 void CodeGenLLVM::visit(GlobalLoadStmt *stmt) {
   int width = stmt->width();
   TI_ASSERT(width == 1);
-  llvm_val[stmt] = builder->CreateLoad(
-      tlctx->get_data_type(stmt->ret_type.data_type), llvm_val[stmt->ptr]);
+  llvm_val[stmt] = builder->CreateLoad(tlctx->get_data_type(stmt->ret_type),
+                                       llvm_val[stmt->ptr]);
 }
 
 void CodeGenLLVM::visit(ElementShuffleStmt *stmt){
@@ -1034,7 +1088,7 @@ void CodeGenLLVM::visit(ElementShuffleStmt *stmt){
         },
         "{");
     if (stmt->pointer) {
-      emit("{} * const {} [{}] {};", data_type_name(stmt->ret_type.data_type),
+      emit("{} * const {} [{}] {};", data_type_name(stmt->ret_type),
            stmt->raw_name(), stmt->width(), init);
     } else {
       emit("const {} {} ({});", stmt->ret_data_type_name(), stmt->raw_name(),
@@ -1084,17 +1138,17 @@ llvm::Value *CodeGenLLVM::call(SNode *snode,
 
 void CodeGenLLVM::visit(GetRootStmt *stmt) {
   llvm_val[stmt] = builder->CreateBitCast(
-      get_root(), PointerType::get(StructCompilerLLVM::get_llvm_node_type(
-                                       module.get(), prog->snode_root.get()),
-                                   0));
+      get_root(),
+      llvm::PointerType::get(StructCompilerLLVM::get_llvm_node_type(
+                                 module.get(), prog->snode_root.get()),
+                             0));
 }
 
-void CodeGenLLVM::visit(OffsetAndExtractBitsStmt *stmt) {
-  auto shifted = builder->CreateAdd(llvm_val[stmt->input],
-                                    tlctx->get_constant((int32)stmt->offset));
+void CodeGenLLVM::visit(BitExtractStmt *stmt) {
   int mask = (1u << (stmt->bit_end - stmt->bit_begin)) - 1;
   llvm_val[stmt] = builder->CreateAnd(
-      builder->CreateLShr(shifted, stmt->bit_begin), tlctx->get_constant(mask));
+      builder->CreateLShr(llvm_val[stmt->input], stmt->bit_begin),
+      tlctx->get_constant(mask));
 }
 
 void CodeGenLLVM::visit(LinearizeStmt *stmt) {
@@ -1150,11 +1204,11 @@ void CodeGenLLVM::visit(GetChStmt *stmt) {
   auto ch = create_call(
       stmt->output_snode->get_ch_from_parent_func_name(),
       {builder->CreateBitCast(llvm_val[stmt->input_ptr],
-                              PointerType::getInt8PtrTy(*llvm_context))});
+                              llvm::PointerType::getInt8PtrTy(*llvm_context))});
   llvm_val[stmt] = builder->CreateBitCast(
-      ch, PointerType::get(StructCompilerLLVM::get_llvm_node_type(
-                               module.get(), stmt->output_snode),
-                           0));
+      ch, llvm::PointerType::get(StructCompilerLLVM::get_llvm_node_type(
+                                     module.get(), stmt->output_snode),
+                                 0));
 }
 
 void CodeGenLLVM::visit(ExternalPtrStmt *stmt) {
@@ -1172,7 +1226,7 @@ void CodeGenLLVM::visit(ExternalPtrStmt *stmt) {
     sizes[i] = raw_arg;
   }
 
-  auto dt = stmt->ret_type.data_type;
+  auto dt = stmt->ret_type.ptr_removed();
   auto base = builder->CreateBitCast(
       llvm_val[stmt->base_ptrs[0]],
       llvm::PointerType::get(tlctx->get_data_type(dt), 0));
@@ -1186,6 +1240,14 @@ void CodeGenLLVM::visit(ExternalPtrStmt *stmt) {
   llvm_val[stmt] = builder->CreateGEP(base, linear_index);
 }
 
+void CodeGenLLVM::visit(ExternalTensorShapeAlongAxisStmt *stmt) {
+  const auto arg_id = stmt->arg_id;
+  const auto axis = stmt->axis;
+  llvm_val[stmt] = builder->CreateCall(
+      get_runtime_function("Context_get_extra_args"),
+      {get_context(), tlctx->get_constant(arg_id), tlctx->get_constant(axis)});
+}
+
 std::string CodeGenLLVM::init_offloaded_task_function(OffloadedStmt *stmt,
                                                       std::string suffix) {
   current_loop_reentry = nullptr;
@@ -1193,13 +1255,14 @@ std::string CodeGenLLVM::init_offloaded_task_function(OffloadedStmt *stmt,
 
   task_function_type =
       llvm::FunctionType::get(llvm::Type::getVoidTy(*llvm_context),
-                              {PointerType::get(context_ty, 0)}, false);
+                              {llvm::PointerType::get(context_ty, 0)}, false);
 
   auto task_kernel_name = fmt::format("{}_{}_{}{}", kernel_name, task_counter,
                                       stmt->task_name(), suffix);
   task_counter += 1;
-  func = Function::Create(task_function_type, Function::ExternalLinkage,
-                          task_kernel_name, module.get());
+  func = llvm::Function::Create(task_function_type,
+                                llvm::Function::ExternalLinkage,
+                                task_kernel_name, module.get());
 
   current_task = std::make_unique<OffloadedTask>(this);
   current_task->begin(task_kernel_name);
@@ -1213,10 +1276,10 @@ std::string CodeGenLLVM::init_offloaded_task_function(OffloadedStmt *stmt,
     func->addParamAttr(0, llvm::Attribute::ByVal);
 
   // entry_block has all the allocas
-  this->entry_block = BasicBlock::Create(*llvm_context, "entry", func);
+  this->entry_block = llvm::BasicBlock::Create(*llvm_context, "entry", func);
 
   // The real function body
-  func_body_bb = BasicBlock::Create(*llvm_context, "body", func);
+  func_body_bb = llvm::BasicBlock::Create(*llvm_context, "body", func);
   builder->SetInsertPoint(func_body_bb);
   return task_kernel_name;
 }
@@ -1229,10 +1292,11 @@ void CodeGenLLVM::finalize_offloaded_task_function() {
   builder->CreateBr(func_body_bb);
 
   if (prog->config.print_kernel_llvm_ir) {
-    TI_INFO("Kernel Module IR");
-    module->print(errs(), nullptr);
+    static FileSequenceWriter writer("taichi_kernel_generic_llvm_ir_{:04d}.ll",
+                                     "unoptimized LLVM IR (generic)");
+    writer.write(module.get());
   }
-  TI_ASSERT(!llvm::verifyFunction(*func, &errs()));
+  TI_ASSERT(!llvm::verifyFunction(*func, &llvm::errs()));
   // TI_INFO("Kernel function verified.");
 }
 
@@ -1243,7 +1307,8 @@ std::tuple<llvm::Value *, llvm::Value *> CodeGenLLVM::get_range_for_bounds(
     begin = tlctx->get_constant(stmt->begin_value);
   } else {
     auto begin_stmt = Stmt::make<GlobalTemporaryStmt>(
-        stmt->begin_offset, VectorType(1, DataType::i32));
+        stmt->begin_offset,
+        TypeFactory::create_vector_or_scalar_type(1, PrimitiveType::i32));
     begin_stmt->accept(this);
     begin = builder->CreateLoad(llvm_val[begin_stmt.get()]);
   }
@@ -1251,7 +1316,8 @@ std::tuple<llvm::Value *, llvm::Value *> CodeGenLLVM::get_range_for_bounds(
     end = tlctx->get_constant(stmt->end_value);
   } else {
     auto end_stmt = Stmt::make<GlobalTemporaryStmt>(
-        stmt->end_offset, VectorType(1, DataType::i32));
+        stmt->end_offset,
+        TypeFactory::create_vector_or_scalar_type(1, PrimitiveType::i32));
     end_stmt->accept(this);
     end = builder->CreateLoad(llvm_val[end_stmt.get()]);
   }
@@ -1259,12 +1325,18 @@ std::tuple<llvm::Value *, llvm::Value *> CodeGenLLVM::get_range_for_bounds(
 }
 
 void CodeGenLLVM::create_offload_struct_for(OffloadedStmt *stmt, bool spmd) {
-  llvm::Function *body;
+  using namespace llvm;
+  // TODO: instead of constructing tons of LLVM IR, writing the logic in
+  // runtime.cpp may be a cleaner solution. See
+  // CodeGenLLVMCPU::create_offload_range_for as an example.
+
+  llvm::Function *body = nullptr;
   auto leaf_block = stmt->snode;
   {
     // Create the loop body function
     auto guard = get_function_creation_guard({
         llvm::PointerType::get(get_runtime_type("Context"), 0),
+        get_tls_buffer_type(),
         llvm::PointerType::get(get_runtime_type("Element"), 0),
         tlctx->get_data_type<int>(),
         tlctx->get_data_type<int>(),
@@ -1272,54 +1344,115 @@ void CodeGenLLVM::create_offload_struct_for(OffloadedStmt *stmt, bool spmd) {
 
     body = guard.body;
 
-    // per-leaf-block for loop
+    /* Function structure:
+     *
+     * function_body (entry):
+     *   loop_index = lower_bound;
+     *   tls_prologue()
+     *   bls_prologue()
+     *   goto loop_test
+     *
+     * loop_test:
+     *   if (loop_index < upper_bound)
+     *     goto loop_body
+     *   else
+     *     goto func_exit
+     *
+     * loop_body:
+     *   initialize_coordinates()
+     *   if (bitmasked voxel is active)
+     *     goto struct_for_body
+     *   else
+     *     goto loop_body_tail
+     *
+     * struct_for_body:
+     *   ... (Run codegen on the StructForStmt::body Taichi Block)
+     *   goto loop_body_tail
+     *
+     * loop_body_tail:
+     *   loop_index += block_dim
+     *   goto loop_test
+     *
+     * func_exit:
+     *   bls_epilogue()
+     *   tls_epilogue()
+     *   return
+     */
+
     auto loop_index =
-        create_entry_block_alloca(Type::getInt32Ty(*llvm_context));
+        create_entry_block_alloca(llvm::Type::getInt32Ty(*llvm_context));
 
-    llvm::Value *threadIdx = nullptr, *blockDim = nullptr;
+    RuntimeObject element("Element", this, builder.get(), get_arg(2));
 
-    RuntimeObject element("Element", this, builder.get(), get_arg(1));
-    auto lower_bound = get_arg(2);
-    auto upper_bound = get_arg(3);
+    // Loop ranges
+    auto lower_bound = get_arg(3);
+    auto upper_bound = get_arg(4);
+
+    parent_coordinates = element.get_ptr("pcoord");
+
+    if (stmt->tls_prologue) {
+      stmt->tls_prologue->accept(this);
+    }
+
+    if (stmt->bls_prologue) {
+      call("block_barrier");  // "__syncthreads()"
+      stmt->bls_prologue->accept(this);
+      call("block_barrier");  // "__syncthreads()"
+    }
+
+    llvm::Value *thread_idx = nullptr, *block_dim = nullptr;
 
     if (spmd) {
-      threadIdx =
+      thread_idx =
           builder->CreateIntrinsic(Intrinsic::nvvm_read_ptx_sreg_tid_x, {}, {});
-      blockDim = builder->CreateIntrinsic(Intrinsic::nvvm_read_ptx_sreg_ntid_x,
-                                          {}, {});
-      builder->CreateStore(builder->CreateAdd(threadIdx, lower_bound),
+      block_dim = builder->CreateIntrinsic(Intrinsic::nvvm_read_ptx_sreg_ntid_x,
+                                           {}, {});
+      builder->CreateStore(builder->CreateAdd(thread_idx, lower_bound),
                            loop_index);
     } else {
       builder->CreateStore(lower_bound, loop_index);
     }
 
-    // test bb
-    auto test_bb = BasicBlock::Create(*llvm_context, "test", func);
-    auto body_bb = BasicBlock::Create(*llvm_context, "loop_body", func);
-    auto after_loop = BasicBlock::Create(*llvm_context, "after_loop", func);
+    auto loop_test_bb = BasicBlock::Create(*llvm_context, "loop_test", func);
+    auto loop_body_bb = BasicBlock::Create(*llvm_context, "loop_body", func);
+    auto body_tail_bb =
+        BasicBlock::Create(*llvm_context, "loop_body_tail", func);
+    auto func_exit = BasicBlock::Create(*llvm_context, "func_exit", func);
+    auto struct_for_body_bb =
+        BasicBlock::Create(*llvm_context, "struct_for_body_body", func);
 
-    builder->CreateBr(test_bb);
+    builder->CreateBr(loop_test_bb);
+
     {
-      builder->SetInsertPoint(test_bb);
+      // loop_test:
+      //   if (loop_index < upper_bound)
+      //     goto loop_body;
+      //   else
+      //     goto func_exit
+
+      builder->SetInsertPoint(loop_test_bb);
       auto cond =
           builder->CreateICmp(llvm::CmpInst::Predicate::ICMP_SLT,
                               builder->CreateLoad(loop_index), upper_bound);
-      builder->CreateCondBr(cond, body_bb, after_loop);
+      builder->CreateCondBr(cond, loop_body_bb, func_exit);
     }
 
-    builder->SetInsertPoint(body_bb);
+    // ***********************
+    // Begin loop_body_bb:
+    builder->SetInsertPoint(loop_body_bb);
 
     // initialize the coordinates
     auto refine =
         get_runtime_function(leaf_block->refine_coordinates_func_name());
     auto new_coordinates = create_entry_block_alloca(physical_coordinate_ty);
-    create_call(refine, {element.get_ptr("pcoord"), new_coordinates,
+
+    create_call(refine, {parent_coordinates, new_coordinates,
                          builder->CreateLoad(loop_index)});
 
     current_coordinates = new_coordinates;
 
     // exec_cond: safe-guard the execution of loop body:
-    //  - if non-POT tensor dim exists, make sure we don't go out of bounds
+    //  - if non-POT field dim exists, make sure we don't go out of bounds
     //  - if leaf block is bitmasked, make sure we only loop over active
     //    voxels
     auto exec_cond = tlctx->get_constant(true);
@@ -1339,8 +1472,9 @@ void CodeGenLLVM::create_offload_struct_for(OffloadedStmt *stmt, bool spmd) {
       }
     }
 
-    if (snode->type == SNodeType::bitmasked) {
-      // test if current voxel is active or not
+    if (snode->type == SNodeType::bitmasked ||
+        snode->type == SNodeType::pointer) {
+      // test whether the current voxel is active or not
       auto is_active = call(snode, element.get("element"), "is_active",
                             {builder->CreateLoad(loop_index)});
       is_active =
@@ -1348,47 +1482,97 @@ void CodeGenLLVM::create_offload_struct_for(OffloadedStmt *stmt, bool spmd) {
       exec_cond = builder->CreateAnd(exec_cond, is_active);
     }
 
-    auto body_bb_tail =
-        BasicBlock::Create(*llvm_context, "loop_body_tail", func);
+    builder->CreateCondBr(exec_cond, struct_for_body_bb, body_tail_bb);
+
     {
-      auto bounded_body_bb =
-          BasicBlock::Create(*llvm_context, "bound_guarded_loop_body", func);
-      builder->CreateCondBr(exec_cond, bounded_body_bb, body_bb_tail);
-      builder->SetInsertPoint(bounded_body_bb);
-      // The real loop body
+      builder->SetInsertPoint(struct_for_body_bb);
+
+      // The real loop body of the StructForStmt
       stmt->body->accept(this);
-      builder->CreateBr(body_bb_tail);
+
+      builder->CreateBr(body_tail_bb);
     }
 
-    // body cfg
+    {
+      // body tail: increment loop_index and jump to loop_test
+      builder->SetInsertPoint(body_tail_bb);
 
-    builder->SetInsertPoint(body_bb_tail);
+      if (spmd) {
+        create_increment(loop_index, block_dim);
+      } else {
+        create_increment(loop_index, tlctx->get_constant(1));
+      }
+      builder->CreateBr(loop_test_bb);
 
-    if (spmd) {
-      create_increment(loop_index, blockDim);
-    } else {
-      create_increment(loop_index, tlctx->get_constant(1));
+      builder->SetInsertPoint(func_exit);
     }
-    builder->CreateBr(test_bb);
 
-    builder->SetInsertPoint(after_loop);
+    if (stmt->bls_epilogue) {
+      call("block_barrier");  // "__syncthreads()"
+      stmt->bls_epilogue->accept(this);
+      call("block_barrier");  // "__syncthreads()"
+    }
+
+    if (stmt->tls_epilogue) {
+      stmt->tls_epilogue->accept(this);
+    }
   }
 
-  if (stmt->block_dim == 0) {
-    stmt->block_dim = std::min(leaf_block->max_num_elements(), 256);
+  int list_element_size =
+      std::min(leaf_block->max_num_elements(), taichi_listgen_max_element_size);
+  int num_splits = std::max(1, list_element_size / stmt->block_dim);
+
+  auto struct_for_func = get_runtime_function("parallel_struct_for");
+
+  if (arch_is_gpu(current_arch())) {
+    // Note that on CUDA local array allocation must have a compile-time
+    // constant size. Therefore, instead of passing in the tls_buffer_size
+    // argument, we directly clone the "parallel_struct_for" function and
+    // replace the "alignas(8) char tls_buffer[1]" statement with "alignas(8)
+    // char tls_buffer[tls_buffer_size]" at compile time.
+
+    auto value_map = llvm::ValueToValueMapTy();
+    auto patched_struct_for_func =
+        llvm::CloneFunction(struct_for_func, value_map);
+
+    int replaced_alloca_types = 0;
+
+    // Find the "1" in "char tls_buffer[1]" and replace it with
+    // "tls_buffer_size"
+    for (auto &bb : *patched_struct_for_func) {
+      for (llvm::Instruction &inst : bb) {
+        auto alloca = llvm::dyn_cast<AllocaInst>(&inst);
+        if (!alloca || alloca->getAlignment() != 8)
+          continue;
+        auto alloca_type = alloca->getAllocatedType();
+        auto char_type = llvm::Type::getInt8Ty(*llvm_context);
+        // Allocated type should be array [1 x i8]
+        if (alloca_type->isArrayTy() &&
+            alloca_type->getArrayNumElements() == 1 &&
+            alloca_type->getArrayElementType() == char_type) {
+          auto new_type = llvm::ArrayType::get(char_type, stmt->tls_size);
+          alloca->setAllocatedType(new_type);
+          replaced_alloca_types += 1;
+        }
+      }
+    }
+
+    // There should be **exactly** one replacement.
+    TI_ASSERT(replaced_alloca_types == 1);
+
+    struct_for_func = patched_struct_for_func;
   }
-  int num_splits = leaf_block->max_num_elements() / stmt->block_dim;
-  // traverse leaf node
-  create_call("for_each_block",
-              {get_context(), tlctx->get_constant(leaf_block->id),
-               tlctx->get_constant(leaf_block->max_num_elements()),
-               tlctx->get_constant(num_splits), body,
-               tlctx->get_constant(stmt->num_cpu_threads)});
+  // Loop over nodes in the element list, in parallel
+  create_call(
+      struct_for_func,
+      {get_context(), tlctx->get_constant(leaf_block->id),
+       tlctx->get_constant(list_element_size), tlctx->get_constant(num_splits),
+       body, tlctx->get_constant(stmt->tls_size),
+       tlctx->get_constant(stmt->num_cpu_threads)});
   // TODO: why do we need num_cpu_threads on GPUs?
 }
 
 void CodeGenLLVM::visit(LoopIndexStmt *stmt) {
-  TI_ASSERT(&module->getContext() == tlctx->get_this_thread_context());
   if (stmt->loop->is<OffloadedStmt>() &&
       stmt->loop->as<OffloadedStmt>()->task_type ==
           OffloadedStmt::TaskType::struct_for) {
@@ -1401,15 +1585,72 @@ void CodeGenLLVM::visit(LoopIndexStmt *stmt) {
   }
 }
 
+void CodeGenLLVM::visit(LoopLinearIndexStmt *stmt) {
+  if (stmt->loop->is<OffloadedStmt>() &&
+      stmt->loop->as<OffloadedStmt>()->task_type ==
+          OffloadedStmt::TaskType::struct_for) {
+    llvm_val[stmt] = create_call("thread_idx");
+  } else {
+    TI_NOT_IMPLEMENTED;
+  }
+}
+
+void CodeGenLLVM::visit(BlockCornerIndexStmt *stmt) {
+  if (stmt->loop->is<OffloadedStmt>() &&
+      stmt->loop->as<OffloadedStmt>()->task_type ==
+          OffloadedStmt::TaskType::struct_for) {
+    TI_ASSERT(parent_coordinates);
+    llvm_val[stmt] = builder->CreateLoad(builder->CreateGEP(
+        parent_coordinates, {tlctx->get_constant(0), tlctx->get_constant(0),
+                             tlctx->get_constant(stmt->index)}));
+  } else {
+    TI_NOT_IMPLEMENTED;
+  }
+}
+
+void CodeGenLLVM::visit(BlockDimStmt *stmt) {
+  TI_NOT_IMPLEMENTED  // No need for this statement for now. Untested so mark it
+                      // as a loud failure.
+      llvm_val[stmt] = create_call("block_dim", {});
+}
+
 void CodeGenLLVM::visit(GlobalTemporaryStmt *stmt) {
   auto runtime = get_runtime();
   auto buffer = call("get_temporary_pointer", runtime,
                      tlctx->get_constant((int64)stmt->offset));
 
   TI_ASSERT(stmt->width() == 1);
-  auto ptr_type =
-      llvm::PointerType::get(tlctx->get_data_type(stmt->ret_type.data_type), 0);
+  auto ptr_type = llvm::PointerType::get(
+      tlctx->get_data_type(stmt->ret_type.ptr_removed()), 0);
   llvm_val[stmt] = builder->CreatePointerCast(buffer, ptr_type);
+}
+
+void CodeGenLLVM::visit(ThreadLocalPtrStmt *stmt) {
+  auto base = get_tls_base_ptr();
+  TI_ASSERT(stmt->width() == 1);
+  auto ptr = builder->CreateGEP(base, tlctx->get_constant(stmt->offset));
+  auto ptr_type = llvm::PointerType::get(
+      tlctx->get_data_type(stmt->ret_type.ptr_removed()), 0);
+  llvm_val[stmt] = builder->CreatePointerCast(ptr, ptr_type);
+}
+
+void CodeGenLLVM::visit(BlockLocalPtrStmt *stmt) {
+  TI_ASSERT(bls_buffer);
+  auto base = bls_buffer;
+  TI_ASSERT(stmt->width() == 1);
+  auto ptr = builder->CreateGEP(
+      base, {tlctx->get_constant(0), llvm_val[stmt->offset]});
+  auto ptr_type = llvm::PointerType::get(
+      tlctx->get_data_type(stmt->ret_type.ptr_removed()), 0);
+  llvm_val[stmt] = builder->CreatePointerCast(ptr, ptr_type);
+}
+
+void CodeGenLLVM::visit(ClearListStmt *stmt) {
+  auto snode_child = stmt->snode;
+  auto snode_parent = stmt->snode->parent;
+  auto meta_child = cast_pointer(emit_struct_meta(snode_child), "StructMeta");
+  auto meta_parent = cast_pointer(emit_struct_meta(snode_parent), "StructMeta");
+  call("clear_list", get_runtime(), meta_parent, meta_child);
 }
 
 void CodeGenLLVM::visit(InternalFuncStmt *stmt) {
@@ -1437,8 +1678,8 @@ void CodeGenLLVM::visit(StackPushStmt *stmt) {
   auto primal_ptr = call("stack_top_primal", llvm_val[stack],
                          tlctx->get_constant(stack->element_size_in_bytes()));
   primal_ptr = builder->CreateBitCast(
-      primal_ptr, llvm::PointerType::get(
-                      tlctx->get_data_type(stmt->ret_type.data_type), 0));
+      primal_ptr,
+      llvm::PointerType::get(tlctx->get_data_type(stmt->ret_type), 0));
   builder->CreateStore(llvm_val[stmt->v], primal_ptr);
 }
 
@@ -1447,8 +1688,8 @@ void CodeGenLLVM::visit(StackLoadTopStmt *stmt) {
   auto primal_ptr = call("stack_top_primal", llvm_val[stack],
                          tlctx->get_constant(stack->element_size_in_bytes()));
   primal_ptr = builder->CreateBitCast(
-      primal_ptr, llvm::PointerType::get(
-                      tlctx->get_data_type(stmt->ret_type.data_type), 0));
+      primal_ptr,
+      llvm::PointerType::get(tlctx->get_data_type(stmt->ret_type), 0));
   llvm_val[stmt] = builder->CreateLoad(primal_ptr);
 }
 
@@ -1457,8 +1698,7 @@ void CodeGenLLVM::visit(StackLoadTopAdjStmt *stmt) {
   auto adjoint = call("stack_top_adjoint", llvm_val[stack],
                       tlctx->get_constant(stack->element_size_in_bytes()));
   adjoint = builder->CreateBitCast(
-      adjoint, llvm::PointerType::get(
-                   tlctx->get_data_type(stmt->ret_type.data_type), 0));
+      adjoint, llvm::PointerType::get(tlctx->get_data_type(stmt->ret_type), 0));
   llvm_val[stmt] = builder->CreateLoad(adjoint);
 }
 
@@ -1467,16 +1707,23 @@ void CodeGenLLVM::visit(StackAccAdjointStmt *stmt) {
   auto adjoint_ptr = call("stack_top_adjoint", llvm_val[stack],
                           tlctx->get_constant(stack->element_size_in_bytes()));
   adjoint_ptr = builder->CreateBitCast(
-      adjoint_ptr, llvm::PointerType::get(
-                       tlctx->get_data_type(stack->ret_type.data_type), 0));
+      adjoint_ptr,
+      llvm::PointerType::get(tlctx->get_data_type(stack->ret_type), 0));
   auto old_val = builder->CreateLoad(adjoint_ptr);
-  TI_ASSERT(is_real(stmt->v->ret_type.data_type));
+  TI_ASSERT(is_real(stmt->v->ret_type));
   auto new_val = builder->CreateFAdd(old_val, llvm_val[stmt->v]);
   builder->CreateStore(new_val, adjoint_ptr);
 }
 
-FunctionType CodeGenLLVM::compile_module_to_executable() {
-  TI_AUTO_PROF
+void CodeGenLLVM::visit(RangeAssumptionStmt *stmt) {
+  llvm_val[stmt] = llvm_val[stmt->input];
+}
+
+void CodeGenLLVM::visit(LoopUniqueStmt *stmt) {
+  llvm_val[stmt] = llvm_val[stmt->input];
+}
+
+void CodeGenLLVM::eliminate_unused_functions() {
   TaichiLLVMContext::eliminate_unused_functions(
       module.get(), [&](std::string func_name) {
         for (auto &task : offloaded_tasks) {
@@ -1485,13 +1732,21 @@ FunctionType CodeGenLLVM::compile_module_to_executable() {
         }
         return false;
       });
+}
+
+FunctionType CodeGenLLVM::compile_module_to_executable() {
+  TI_AUTO_PROF
+  eliminate_unused_functions();
+
   tlctx->add_module(std::move(module));
 
   for (auto &task : offloaded_tasks) {
     task.compile();
   }
   auto offloaded_tasks_local = offloaded_tasks;
+  auto kernel_name_ = kernel_name;
   return [=](Context &context) {
+    TI_TRACE("Launching kernel {}", kernel_name_);
     for (auto task : offloaded_tasks_local) {
       task(&context);
     }
@@ -1525,6 +1780,24 @@ llvm::Value *CodeGenLLVM::get_context() {
   return get_arg(0);
 }
 
+llvm::Value *CodeGenLLVM::get_tls_base_ptr() {
+  return get_arg(1);
+}
+
+llvm::Type *CodeGenLLVM::get_tls_buffer_type() {
+  return llvm::Type::getInt8PtrTy(*llvm_context);
+}
+
+std::vector<llvm::Type *> CodeGenLLVM::get_xlogue_argument_types() {
+  return {llvm::PointerType::get(get_runtime_type("Context"), 0),
+          get_tls_buffer_type()};
+}
+
+llvm::Type *CodeGenLLVM::get_xlogue_function_type() {
+  return llvm::FunctionType::get(llvm::Type::getVoidTy(*llvm_context),
+                                 get_xlogue_argument_types(), false);
+}
+
 llvm::Value *CodeGenLLVM::get_root() {
   return create_call("LLVMRuntime_get_root", {get_runtime()});
 }
@@ -1549,6 +1822,23 @@ void CodeGenLLVM::emit_to_module() {
 FunctionType CodeGenLLVM::gen() {
   emit_to_module();
   return compile_module_to_executable();
+}
+
+llvm::Value *CodeGenLLVM::create_xlogue(std::unique_ptr<Block> &block) {
+  llvm::Value *xlogue;
+
+  auto xlogue_type = get_xlogue_function_type();
+  auto xlogue_ptr_type = llvm::PointerType::get(xlogue_type, 0);
+
+  if (block) {
+    auto guard = get_function_creation_guard(get_xlogue_argument_types());
+    block->accept(this);
+    xlogue = guard.body;
+  } else {
+    xlogue = llvm::ConstantPointerNull::get(xlogue_ptr_type);
+  }
+
+  return xlogue;
 }
 
 TLANG_NAMESPACE_END

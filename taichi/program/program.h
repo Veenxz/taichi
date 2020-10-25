@@ -8,15 +8,17 @@
 
 #define TI_RUNTIME_HOST
 #include "taichi/ir/ir.h"
+#include "taichi/ir/type_factory.h"
 #include "taichi/ir/snode.h"
 #include "taichi/lang_util.h"
 #include "taichi/llvm/llvm_context.h"
 #include "taichi/backends/metal/kernel_manager.h"
 #include "taichi/backends/opengl/opengl_kernel_launcher.h"
 #include "taichi/backends/opengl/opengl_kernel_util.h"
+#include "taichi/backends/cc/cc_program.h"
 #include "taichi/program/kernel.h"
-#include "taichi/program/profiler.h"
-#include "taichi/runtime/llvm/context.h"
+#include "taichi/program/kernel_profiler.h"
+#include "taichi/program/context.h"
 #include "taichi/runtime/runtime.h"
 #include "taichi/backends/metal/struct_metal.h"
 #include "taichi/system/memory_pool.h"
@@ -56,9 +58,8 @@ template <>
 struct hash<taichi::lang::JITEvaluatorId> {
   std::size_t operator()(taichi::lang::JITEvaluatorId const &id) const
       noexcept {
-    return ((std::size_t)id.op | ((std::size_t)id.ret << 8) |
-            ((std::size_t)id.lhs << 16) | ((std::size_t)id.rhs << 24) |
-            ((std::size_t)id.is_binary << 31)) ^
+    return ((std::size_t)id.op | (id.ret.hash() << 8) | (id.lhs.hash() << 16) |
+            (id.rhs.hash() << 24) | ((std::size_t)id.is_binary << 31)) ^
            (std::hash<std::thread::id>{}(id.thread_id) << 32);
   }
 };
@@ -83,7 +84,6 @@ class Program {
   std::unique_ptr<SNode> snode_root;  // pointer to the data structure.
   void *llvm_runtime;
   CompileConfig config;
-  Context context;
   std::unique_ptr<TaichiLLVMContext> llvm_context_host, llvm_context_device;
   bool sync;  // device/host synchronized?
   bool finalized;
@@ -93,28 +93,33 @@ class Program {
   std::unique_ptr<MemoryPool> memory_pool;
   uint64 *result_buffer;             // TODO: move this
   void *preallocated_device_buffer;  // TODO: move this to memory allocator
+  std::unordered_map<int, SNode *> snodes;
 
   std::unique_ptr<Runtime> runtime;
   std::unique_ptr<AsyncEngine> async_engine;
 
   std::vector<std::unique_ptr<Kernel>> kernels;
 
-  std::unique_ptr<ProfilerBase> profiler;
+  std::unique_ptr<KernelProfilerBase> profiler;
 
   std::unordered_map<JITEvaluatorId, std::unique_ptr<Kernel>>
       jit_evaluator_cache;
   std::mutex jit_evaluator_cache_mut;
+
+  // Note: for now we let all Programs share a single TypeFactory for smooth
+  // migration. In the future each program should have its own copy.
+  static TypeFactory &get_type_factory();
 
   Program() : Program(default_compile_config.arch) {
   }
 
   Program(Arch arch);
 
-  void profiler_print() {
+  void kernel_profiler_print() {
     profiler->print();
   }
 
-  void profiler_clear() {
+  void kernel_profiler_clear() {
     profiler->clear();
   }
 
@@ -126,17 +131,17 @@ class Program {
     profiler->stop();
   }
 
-  ProfilerBase *get_profiler() {
+  KernelProfilerBase *get_profiler() {
     return profiler.get();
   }
 
-  Context &get_context() {
-    context.runtime = (LLVMRuntime *)llvm_runtime;
-    return context;
-  }
   void initialize_device_llvm_context();
 
   void synchronize();
+
+  // This is more primitive than synchronize(). It directly calls to the
+  // targeted GPU backend's synchronization (or commit in Metal's terminology).
+  void device_synchronize();
 
   void layout(std::function<void()> func) {
     func();
@@ -180,7 +185,13 @@ class Program {
   void end_function_definition() {
   }
 
+  // TODO: This function is doing two things: 1) compiling CHI IR, and 2)
+  // offloading them to each backend. We should probably separate the logic?
   FunctionType compile(Kernel &kernel);
+
+  // Just does the per-backend executable compilation without kernel lowering.
+  FunctionType compile_to_backend_executable(Kernel &kernel,
+                                             OffloadedStmt *stmt);
 
   void initialize_runtime_system(StructCompiler *scomp);
 
@@ -234,7 +245,31 @@ class Program {
     snode_root->print();
   }
 
-  void launch_async(Kernel *kernel);
+  int default_block_dim() const;
+
+  void print_list_manager_info(void *list_manager);
+
+  void print_memory_profiler_info();
+
+  template <typename T, typename... Args>
+  T runtime_query(const std::string &key, Args... args) {
+    TI_ASSERT(arch_uses_llvm(config.arch));
+
+    TaichiLLVMContext *tlctx = nullptr;
+    if (llvm_context_device) {
+      tlctx = llvm_context_device.get();
+    } else {
+      tlctx = llvm_context_host.get();
+    }
+
+    auto runtime = tlctx->runtime_jit_module;
+    runtime->call<void *, Args...>("runtime_" + key, llvm_runtime,
+                                   std::forward<Args>(args)...);
+    return fetch_result<T>(taichi_result_buffer_runtime_query_id);
+  }
+
+  // Returns zero if the SNode is statically allocated
+  std::size_t get_snode_num_dynamically_allocated(SNode *snode);
 
   ~Program();
 
@@ -245,6 +280,12 @@ class Program {
   // OpenGL related data structures
   std::optional<opengl::StructCompiledResult> opengl_struct_compiled_;
   std::unique_ptr<opengl::GLSLLauncher> opengl_kernel_launcher_;
+
+ public:
+#ifdef TI_WITH_CC
+  // C backend related data structures
+  std::unique_ptr<cccp::CCProgram> cc_program;
+#endif
 };
 
 TLANG_NAMESPACE_END

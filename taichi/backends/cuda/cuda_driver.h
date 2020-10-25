@@ -1,5 +1,7 @@
 #pragma once
 
+#include <mutex>
+
 #include "taichi/system/dynamic_loader.h"
 
 #if (0)
@@ -22,12 +24,15 @@ TLANG_NAMESPACE_BEGIN
 // Driver constants from cuda.h
 
 constexpr uint32 CU_EVENT_DEFAULT = 0x0;
+constexpr uint32 CU_STREAM_DEFAULT = 0x0;
+constexpr uint32 CU_STREAM_NON_BLOCKING = 0x1;
 constexpr uint32 CU_MEM_ATTACH_GLOBAL = 0x1;
 constexpr uint32 CU_MEM_ADVISE_SET_PREFERRED_LOCATION = 3;
 constexpr uint32 CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X = 2;
 constexpr uint32 CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16;
 constexpr uint32 CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75;
 constexpr uint32 CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76;
+constexpr uint32 CUDA_ERROR_ASSERT = 710;
 
 std::string get_cuda_error_message(uint32 err);
 
@@ -44,6 +49,8 @@ class CUDADriverFunction {
 
   uint32 call(Args... args) {
     TI_ASSERT(function != nullptr);
+    TI_ASSERT(driver_lock != nullptr);
+    std::lock_guard<std::mutex> _(*driver_lock);
     return (uint32)function(args...);
   }
 
@@ -52,14 +59,19 @@ class CUDADriverFunction {
     this->symbol_name = symbol_name;
   }
 
+  void set_lock(std::mutex *lock) {
+    driver_lock = lock;
+  }
+
   std::string get_error_message(uint32 err) {
     return get_cuda_error_message(err) +
            fmt::format(" while calling {} ({})", name, symbol_name);
   }
 
-  void call_with_warning(Args... args) {
+  uint32 call_with_warning(Args... args) {
     auto err = call(args...);
-    TI_WARN_IF(err, get_error_message(err));
+    TI_WARN_IF(err, "{}", get_error_message(err));
+    return err;
   }
 
   // Note: CUDA driver API passes everything as value
@@ -70,8 +82,10 @@ class CUDADriverFunction {
 
  private:
   using func_type = uint32_t(Args...);
-  func_type *function;
+
+  func_type *function{nullptr};
   std::string name, symbol_name;
+  std::mutex *driver_lock{nullptr};
 };
 
 class CUDADriver {
@@ -97,6 +111,8 @@ class CUDADriver {
   CUDADriver();
 
   std::unique_ptr<DynamicLoader> loader;
+
+  std::mutex lock;
 };
 
 TLANG_NAMESPACE_END

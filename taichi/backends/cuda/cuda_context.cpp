@@ -37,7 +37,18 @@ CUDAContext::CUDAContext()
   TI_TRACE("Total memory {:.2f} GB; free memory {:.2f} GB",
            get_total_memory() / GB, get_free_memory() / GB);
 
-  mcpu = fmt::format("sm_{}{}", cc_major, cc_minor);
+  compute_capability = cc_major * 10 + cc_minor;
+
+  if (compute_capability > 75) {
+    // The NVPTX backend of LLVM 10.0.0 does not seem to support
+    // compute_capability > 75 yet. See
+    // llvm-10.0.0.src/build/lib/Target/NVPTX/NVPTXGenSubtargetInfo.inc
+    compute_capability = 75;
+  }
+
+  mcpu = fmt::format("sm_{}", compute_capability);
+
+  TI_TRACE("Emitting CUDA code for {}", mcpu);
 }
 
 std::size_t CUDAContext::get_total_memory() {
@@ -55,19 +66,34 @@ std::size_t CUDAContext::get_free_memory() {
 void CUDAContext::launch(void *func,
                          const std::string &task_name,
                          std::vector<void *> arg_pointers,
-                         unsigned gridDim,
-                         unsigned blockDim) {
+                         unsigned grid_dim,
+                         unsigned block_dim,
+                         std::size_t shared_mem_bytes) {
+  // It is important to keep a handle since in async mode
+  // a constant folding kernel may happen during a kernel launch
+  // then profiler->start and profiler->stop mismatch.
+
+  KernelProfilerBase::TaskHandle task_handle;
   // Kernel launch
   if (profiler)
-    profiler->start(task_name);
+    task_handle = profiler->start_with_handle(task_name);
   auto context_guard = CUDAContext::get_instance().get_guard();
-  if (gridDim > 0) {
+
+  // TODO: remove usages of get_current_program here.
+  // Make sure there are not too many threads for the device.
+  // Note that the CUDA random number generator does not allow more than
+  // [saturating_grid_dim * max_block_dim] threads.
+  TI_ASSERT(grid_dim <= get_current_program().config.saturating_grid_dim);
+  TI_ASSERT(block_dim <= get_current_program().config.max_block_dim);
+
+  if (grid_dim > 0) {
     std::lock_guard<std::mutex> _(lock);
-    driver.launch_kernel(func, gridDim, 1, 1, blockDim, 1, 1, 0, nullptr,
-                         arg_pointers.data(), nullptr);
+    driver.launch_kernel(func, grid_dim, 1, 1, block_dim, 1, 1,
+                         shared_mem_bytes, nullptr, arg_pointers.data(),
+                         nullptr);
   }
   if (profiler)
-    profiler->stop();
+    profiler->stop(task_handle);
 
   if (get_current_program().config.debug) {
     driver.stream_synchronize(nullptr);
@@ -85,20 +111,8 @@ CUDAContext::~CUDAContext() {
 }
 
 CUDAContext &CUDAContext::get_instance() {
-  static std::unordered_map<std::thread::id, CUDAContext *> instances;
-  static std::mutex mut;
-  {
-    // critical section
-    auto _ = std::lock_guard<std::mutex>(mut);
-
-    auto tid = std::this_thread::get_id();
-    if (instances.find(tid) == instances.end()) {
-      instances[tid] = new CUDAContext();
-      // We expect CUDAContext to live until the process ends, thus the raw
-      // pointers and `new`s.
-    }
-    return *instances[tid];
-  }
+  static auto context = new CUDAContext();
+  return *context;
 }
 
 TLANG_NAMESPACE_END

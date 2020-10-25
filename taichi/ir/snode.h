@@ -12,12 +12,14 @@ TLANG_NAMESPACE_BEGIN
 
 class Expr;
 class Kernel;
+class Stmt;
 
 struct IndexExtractor {
   int start;
   int num_bits;
   int acc_offset;
   int num_elements;
+  int trailing_bits;
 
   // TODO: rename start to src_offset
 
@@ -29,6 +31,7 @@ struct IndexExtractor {
     active = false;
     acc_offset = 0;
     num_elements = 1;
+    trailing_bits = 0;
   }
 
   void activate(int num_bits) {
@@ -73,6 +76,7 @@ class SNode {
   int64 n{};
   int total_num_bits{}, total_bit_start{};
   int chunk_size{};
+  PrimitiveType *physical_type;  // for bit_struct and bit_array only
   DataType dt;
   bool has_ambient{};
   TypedConstant ambient_val;
@@ -81,6 +85,14 @@ class SNode {
   Kernel *reader_kernel{};
   Kernel *writer_kernel{};
   Expr expr;
+
+  // is_bit_level=false: the SNode is not bitpacked
+  // is_bit_level=true: the SNode is bitpacked (i.e., strictly inside bit_struct
+  // or bit_array)
+  bool is_bit_level{false};
+
+  // Whether the path from root to |this| contains only `dense` SNodes.
+  bool is_path_all_dense{false};
 
   SNode();
 
@@ -98,11 +110,9 @@ class SNode {
 
   std::string get_node_type_name_hinted() const;
 
-  SNode &insert_children(SNodeType t) {
-    ch.push_back(create(depth + 1, t));
-    // Note: parent will not be set until structural nodes are compiled!
-    return *ch.back();
-  }
+  int get_num_bits(int physical_index) const;
+
+  SNode &insert_children(SNodeType t);
 
   SNode &create_node(std::vector<Index> indices,
                      std::vector<int> sizes,
@@ -161,14 +171,11 @@ class SNode {
     return hash(std::vector<Index>{index}, size);
   }
 
-  template <typename... Args>
-  static std::unique_ptr<SNode> create(Args &&... args) {
-    return std::make_unique<SNode>(std::forward<Args>(args)...);
-  }
-
   std::string type_name() {
     return snode_type_name(type);
   }
+
+  SNode &bit_struct(int bits);
 
   void print();
 
@@ -218,6 +225,8 @@ class SNode {
 
   bool is_place() const;
 
+  bool is_scalar() const;
+
   const Expr &get_expr() const {
     return expr;
   }
@@ -248,9 +257,7 @@ class SNode {
     return 1 << total_num_bits;
   }
 
-  int num_elements_along_axis(int i) const;
-
-  void set_kernel_args(Kernel *kernel, const std::vector<int> &I);
+  int shape_along_axis(int i) const;
 
   uint64 fetch_reader_result();  // TODO: refactor
 };

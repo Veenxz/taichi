@@ -1,4 +1,6 @@
 #include "taichi/ir/ir.h"
+#include "taichi/ir/analysis.h"
+#include "taichi/ir/statements.h"
 #include "taichi/ir/transforms.h"
 #include "taichi/ir/visitors.h"
 #include "taichi/ir/state_machine.h"
@@ -316,7 +318,7 @@ class GlobalTempOptimize : public VariableOptimize {
   }
 
   void visit(OffloadedStmt *stmt) override {
-    if (stmt->task_type == stmt->range_for) {
+    if (stmt->task_type == OffloadedTaskType::range_for) {
       TI_ASSERT(!maybe_run);
       if (!stmt->const_begin) {
         TI_ASSERT(state_machines.find(stmt->begin_offset) !=
@@ -381,7 +383,8 @@ class GlobalPtrOptimize : public VariableOptimize {
       get_state_machine(stmt->dest).atomic_op(stmt);
     auto dest = stmt->dest->as<GlobalPtrStmt>();
     for (auto &var : state_machines[dest->snodes[0]->id]) {
-      if (var.first != dest && maybe_same_address(dest, var.first)) {
+      if (var.first != dest &&
+          irpass::analysis::maybe_same_address(dest, var.first)) {
         var.second.maybe_atomic_op();
       }
     }
@@ -396,7 +399,8 @@ class GlobalPtrOptimize : public VariableOptimize {
       get_state_machine(stmt->ptr).store(stmt);
     auto dest = stmt->ptr->as<GlobalPtrStmt>();
     for (auto &var : state_machines[dest->snodes[0]->id]) {
-      if (var.first != dest && maybe_same_address(dest, var.first)) {
+      if (var.first != dest &&
+          irpass::analysis::maybe_same_address(dest, var.first)) {
         var.second.maybe_store(stmt);
       }
     }
@@ -411,7 +415,8 @@ class GlobalPtrOptimize : public VariableOptimize {
       get_state_machine(stmt->ptr).load(stmt);
     auto dest = stmt->ptr->as<GlobalPtrStmt>();
     for (auto &var : state_machines[dest->snodes[0]->id]) {
-      if (var.first != dest && maybe_same_address(dest, var.first)) {
+      if (var.first != dest &&
+          irpass::analysis::maybe_same_address(dest, var.first)) {
         var.second.maybe_load();
       }
     }
@@ -526,7 +531,7 @@ class OtherVariableOptimize : public VariableOptimize {
       get_state_machine(stmt->dest).atomic_op(stmt);
     for (auto &var : state_machines) {
       if (var.first != stmt->dest &&
-          maybe_same_address(stmt->dest, var.first)) {
+          irpass::analysis::maybe_same_address(stmt->dest, var.first)) {
         var.second.maybe_atomic_op();
       }
     }
@@ -540,7 +545,8 @@ class OtherVariableOptimize : public VariableOptimize {
     else
       get_state_machine(stmt->ptr).store(stmt);
     for (auto &var : state_machines) {
-      if (var.first != stmt->ptr && maybe_same_address(stmt->ptr, var.first)) {
+      if (var.first != stmt->ptr &&
+          irpass::analysis::maybe_same_address(stmt->ptr, var.first)) {
         var.second.maybe_store(stmt);
       }
     }
@@ -554,7 +560,8 @@ class OtherVariableOptimize : public VariableOptimize {
     else
       get_state_machine(stmt->ptr).load(stmt);
     for (auto &var : state_machines) {
-      if (var.first != stmt->ptr && maybe_same_address(stmt->ptr, var.first)) {
+      if (var.first != stmt->ptr &&
+          irpass::analysis::maybe_same_address(stmt->ptr, var.first)) {
         var.second.maybe_load();
       }
     }
@@ -617,7 +624,9 @@ class OtherVariableOptimize : public VariableOptimize {
 
 namespace irpass {
 void variable_optimization(IRNode *root, bool after_lower_access) {
-  if (!advanced_optimization)
+  TI_AUTO_PROF;
+  // This pass has been replaced with cfg_optimization.
+  if (!root->get_config().advanced_optimization)
     return;
   AllocaOptimize alloca_optimizer;
   alloca_optimizer.run(root);

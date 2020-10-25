@@ -15,16 +15,23 @@ class CFGBuilder : public IRVisitor {
   int current_stmt_id;
   int begin_location;
   std::vector<CFGNode *> prev_nodes;
+  OffloadedStmt *current_offload;
+  bool in_parallel_for;
 
  public:
   CFGBuilder()
       : current_block(nullptr),
         last_node_in_current_block(nullptr),
         current_stmt_id(-1),
-        begin_location(-1) {
+        begin_location(-1),
+        current_offload(nullptr),
+        in_parallel_for(false) {
     allow_undefined_visitor = true;
     invoke_default_visitor = true;
     graph = std::make_unique<ControlFlowGraph>();
+    // Make an empty start node.
+    auto start_node = graph->push_back();
+    prev_nodes.push_back(start_node);
   }
 
   void visit(Stmt *stmt) override {
@@ -35,7 +42,7 @@ class CFGBuilder : public IRVisitor {
 
   CFGNode *new_node(int next_begin_location) {
     auto node = graph->push_back(current_block, begin_location, current_stmt_id,
-                                 last_node_in_current_block);
+                                 in_parallel_for, last_node_in_current_block);
     for (auto &prev_node : prev_nodes) {
       CFGNode::add_edge(prev_node, node);
     }
@@ -120,38 +127,68 @@ class CFGBuilder : public IRVisitor {
   }
 
   void visit(RangeForStmt *stmt) override {
+    auto old_in_parallel_for = in_parallel_for;
+    if (!current_offload)
+      in_parallel_for = true;
     visit_loop(stmt->body.get(), new_node(-1), false);
+    in_parallel_for = old_in_parallel_for;
   }
 
   void visit(StructForStmt *stmt) override {
+    auto old_in_parallel_for = in_parallel_for;
+    if (!current_offload)
+      in_parallel_for = true;
     visit_loop(stmt->body.get(), new_node(-1), false);
+    in_parallel_for = old_in_parallel_for;
   }
 
   void visit(OffloadedStmt *stmt) override {
+    current_offload = stmt;
+    // TODO: support BLS here
+    if (stmt->tls_prologue) {
+      auto before_offload = new_node(-1);
+      int offload_stmt_id = current_stmt_id;
+      auto block_begin_index = graph->size();
+      stmt->tls_prologue->accept(this);
+      prev_nodes.push_back(graph->back());
+      // Container statements don't belong to any CFGNodes.
+      begin_location = offload_stmt_id + 1;
+      CFGNode::add_edge(before_offload, graph->nodes[block_begin_index].get());
+    }
     if (stmt->has_body()) {
       auto before_offload = new_node(-1);
-      if (stmt->task_type == OffloadedStmt::TaskType::struct_for ||
-          stmt->task_type == OffloadedStmt::TaskType::range_for) {
-        visit_loop(stmt->body.get(), before_offload, false);
-      } else {
-        TI_ASSERT(stmt->task_type == OffloadedStmt::TaskType::serial);
-        int offload_stmt_id = current_stmt_id;
-        auto block_begin_index = graph->size();
-        stmt->body->accept(this);
-        prev_nodes.push_back(graph->back());
-        // Container statements don't belong to any CFGNodes.
-        begin_location = offload_stmt_id + 1;
-        CFGNode::add_edge(before_offload,
-                          graph->nodes[block_begin_index].get());
+      int offload_stmt_id = current_stmt_id;
+      auto block_begin_index = graph->size();
+      if (stmt->task_type == OffloadedStmt::TaskType::range_for ||
+          stmt->task_type == OffloadedStmt::TaskType::struct_for) {
+        in_parallel_for = true;
       }
+      stmt->body->accept(this);
+      in_parallel_for = false;
+      prev_nodes.push_back(graph->back());
+      // Container statements don't belong to any CFGNodes.
+      begin_location = offload_stmt_id + 1;
+      CFGNode::add_edge(before_offload, graph->nodes[block_begin_index].get());
     }
+    if (stmt->tls_epilogue) {
+      auto before_offload = new_node(-1);
+      int offload_stmt_id = current_stmt_id;
+      auto block_begin_index = graph->size();
+      stmt->tls_epilogue->accept(this);
+      prev_nodes.push_back(graph->back());
+      // Container statements don't belong to any CFGNodes.
+      begin_location = offload_stmt_id + 1;
+      CFGNode::add_edge(before_offload, graph->nodes[block_begin_index].get());
+    }
+    current_offload = nullptr;
   }
 
   void visit(Block *block) override {
     auto backup_block = current_block;
     auto backup_last_node = last_node_in_current_block;
+    auto backup_stmt_id = current_stmt_id;
     TI_ASSERT(begin_location == -1);
-    TI_ASSERT(prev_nodes.empty());
+    TI_ASSERT(prev_nodes.empty() || graph->size() == 1);
     current_block = block;
     last_node_in_current_block = nullptr;
     begin_location = 0;
@@ -162,14 +199,22 @@ class CFGBuilder : public IRVisitor {
     }
     current_stmt_id = block->size();
     new_node(-1);  // Each block has a deterministic last node.
+    graph->final_node = (int)graph->size() - 1;
 
     current_block = backup_block;
     last_node_in_current_block = backup_last_node;
+    current_stmt_id = backup_stmt_id;
   }
 
   static std::unique_ptr<ControlFlowGraph> run(IRNode *root) {
     CFGBuilder builder;
     root->accept(&builder);
+    if (!builder.graph->nodes[builder.graph->final_node]->empty()) {
+      builder.graph->push_back();
+      CFGNode::add_edge(builder.graph->nodes[builder.graph->final_node].get(),
+                        builder.graph->back());
+      builder.graph->final_node = (int)builder.graph->size() - 1;
+    }
     return std::move(builder.graph);
   }
 };

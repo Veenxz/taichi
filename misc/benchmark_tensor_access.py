@@ -5,7 +5,7 @@ import math
 
 libm = ctypes.CDLL('libm.so.6')
 
-x, y = ti.var(ti.f32), ti.var(ti.f32)
+x, y = ti.field(ti.f32), ti.field(ti.f32)
 
 
 @ti.kernel
@@ -16,10 +16,7 @@ def laplace():
                                                j] - x[i, j - 1] - x[i, j + 1]
 
 
-@ti.layout
-def place_variables():
-    ti.root.dense(ti.ij, (16, 16)).place(x).place(y)
-
+ti.root.dense(ti.ij, (16, 16)).place(x).place(y)
 
 laplace()
 

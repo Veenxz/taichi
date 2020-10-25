@@ -22,6 +22,12 @@
     return lhs op rhs;                                                     \
   }
 
+#define DEFINE_EXPRESSION_OP_TERNARY(opname)                                 \
+  Expr expr_##opname(const Expr &cond, const Expr &lhs, const Expr &rhs) {   \
+    return Expr::make<TernaryOpExpression>(TernaryOpType::opname, cond, lhs, \
+                                           rhs);                             \
+  }
+
 #define DEFINE_EXPRESSION_FUNC(opname)                                     \
   Expr opname(const Expr &lhs, const Expr &rhs) {                          \
     return Expr::make<BinaryOpExpression>(BinaryOpType::opname, lhs, rhs); \
@@ -35,6 +41,9 @@
 #define DEFINE_EXPRESSION_OP_BINARY(op, opname)       \
   Expr operator op(const Expr &lhs, const Expr &rhs); \
   Expr expr_##opname(const Expr &lhs, const Expr &rhs);
+
+#define DEFINE_EXPRESSION_OP_TERNARY(opname) \
+  Expr expr_##opname(const Expr &cond, const Expr &lhs, const Expr &rhs);
 
 #define DEFINE_EXPRESSION_OP_UNARY(opname) \
   Expr opname(const Expr &expr);           \
@@ -74,6 +83,8 @@ DEFINE_EXPRESSION_OP_BINARY(||, bit_or)
 // DEFINE_EXPRESSION_OP_BINARY(&, bit_and)
 // DEFINE_EXPRESSION_OP_BINARY(|, bit_or)
 DEFINE_EXPRESSION_OP_BINARY (^, bit_xor)
+DEFINE_EXPRESSION_OP_BINARY(<<, bit_shl)
+DEFINE_EXPRESSION_OP_BINARY(>>, bit_sar)
 DEFINE_EXPRESSION_OP_BINARY(<, cmp_lt)
 DEFINE_EXPRESSION_OP_BINARY(<=, cmp_le)
 DEFINE_EXPRESSION_OP_BINARY(>, cmp_gt)
@@ -81,13 +92,17 @@ DEFINE_EXPRESSION_OP_BINARY(>=, cmp_ge)
 DEFINE_EXPRESSION_OP_BINARY(==, cmp_eq)
 DEFINE_EXPRESSION_OP_BINARY(!=, cmp_ne)
 
+DEFINE_EXPRESSION_OP_TERNARY(select)
+
 DEFINE_EXPRESSION_FUNC(min);
 DEFINE_EXPRESSION_FUNC(max);
 DEFINE_EXPRESSION_FUNC(atan2);
 DEFINE_EXPRESSION_FUNC(pow);
 DEFINE_EXPRESSION_FUNC(truediv);
 DEFINE_EXPRESSION_FUNC(floordiv);
+DEFINE_EXPRESSION_FUNC(bit_shr)
 
 #undef DEFINE_EXPRESSION_OP_UNARY
 #undef DEFINE_EXPRESSION_OP_BINARY
+#undef DEFINE_EXPRESSION_OP_TERNARY
 #undef DEFINE_EXPRESSION_FUNC

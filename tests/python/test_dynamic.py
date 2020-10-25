@@ -2,12 +2,16 @@ import taichi as ti
 
 
 def ti_support_dynamic(test):
-    return ti.archs_excluding(ti.opengl)(test)
+    return ti.archs_excluding(ti.cc)(test)
+
+
+def ti_support_non_top_dynamic(test):
+    return ti.archs_excluding(ti.opengl, ti.cc)(test)
 
 
 @ti_support_dynamic
 def test_dynamic():
-    x = ti.var(ti.f32)
+    x = ti.field(ti.f32)
     n = 128
 
     ti.root.dynamic(ti.i, n, 32).place(x)
@@ -25,7 +29,7 @@ def test_dynamic():
 
 @ti_support_dynamic
 def test_dynamic2():
-    x = ti.var(ti.f32)
+    x = ti.field(ti.f32)
     n = 128
 
     ti.root.dynamic(ti.i, n, 32).place(x)
@@ -43,7 +47,7 @@ def test_dynamic2():
 
 @ti_support_dynamic
 def test_dynamic_matrix():
-    x = ti.Matrix(2, 1, dt=ti.i32)
+    x = ti.Matrix.field(2, 1, dtype=ti.i32)
     n = 8192
 
     ti.root.dynamic(ti.i, n, chunk_size=128).place(x)
@@ -66,7 +70,7 @@ def test_dynamic_matrix():
 
 @ti_support_dynamic
 def test_append():
-    x = ti.var(ti.i32)
+    x = ti.field(ti.i32)
     n = 128
 
     ti.root.dynamic(ti.i, n, 32).place(x)
@@ -88,8 +92,8 @@ def test_append():
 
 @ti_support_dynamic
 def test_length():
-    x = ti.var(ti.i32)
-    y = ti.var(ti.f32, shape=())
+    x = ti.field(ti.i32)
+    y = ti.field(ti.f32, shape=())
     n = 128
 
     ti.root.dynamic(ti.i, n, 32).place(x)
@@ -112,9 +116,9 @@ def test_length():
 
 @ti_support_dynamic
 def test_append_ret_value():
-    x = ti.var(ti.i32)
-    y = ti.var(ti.i32)
-    z = ti.var(ti.i32)
+    x = ti.field(ti.i32)
+    y = ti.field(ti.i32)
+    z = ti.field(ti.i32)
     n = 128
 
     ti.root.dynamic(ti.i, n, 32).place(x)
@@ -135,11 +139,11 @@ def test_append_ret_value():
         assert x[i] + 3 == z[i]
 
 
-@ti_support_dynamic
+@ti_support_non_top_dynamic
 def test_dense_dynamic():
     n = 128
-    x = ti.var(ti.i32)
-    l = ti.var(ti.i32, shape=n)
+    x = ti.field(ti.i32)
+    l = ti.field(ti.i32, shape=n)
 
     ti.root.dense(ti.i, n).dynamic(ti.j, n, 8).place(x)
 
@@ -159,11 +163,11 @@ def test_dense_dynamic():
         assert l[i] == n
 
 
-@ti_support_dynamic
+@ti_support_non_top_dynamic
 def test_dense_dynamic_len():
     n = 128
-    x = ti.var(ti.i32)
-    l = ti.var(ti.i32, shape=n)
+    x = ti.field(ti.i32)
+    l = ti.field(ti.i32, shape=n)
 
     ti.root.dense(ti.i, n).dynamic(ti.j, n, 32).place(x)
 
@@ -176,3 +180,31 @@ def test_dense_dynamic_len():
 
     for i in range(n):
         assert l[i] == 0
+
+
+@ti_support_dynamic
+def test_dynamic_activate():
+    ti.init(arch=ti.metal)
+    # record the lengths
+    l = ti.field(ti.i32, 3)
+    x = ti.field(ti.i32)
+    xp = ti.root.dynamic(ti.i, 32, 32)
+    xp.place(x)
+
+    m = 5
+
+    @ti.kernel
+    def func():
+        for i in range(m):
+            ti.append(xp, [], i)
+        l[0] = ti.length(xp, [])
+        x[20] = 42
+        l[1] = ti.length(xp, [])
+        x[10] = 43
+        l[2] = ti.length(xp, [])
+
+    func()
+    l = l.to_numpy()
+    assert l[0] == m
+    assert l[1] == 21
+    assert l[2] == 21

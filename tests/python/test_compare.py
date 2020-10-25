@@ -4,10 +4,10 @@ import taichi as ti
 @ti.require(ti.extension.sparse)
 @ti.all_archs
 def test_compare_basics():
-    a = ti.var(ti.i32)
+    a = ti.field(ti.i32)
     ti.root.dynamic(ti.i, 256).place(a)
-    b = ti.var(ti.i32, shape=())
-    c = ti.var(ti.i32, shape=())
+    b = ti.field(ti.i32, shape=())
+    c = ti.field(ti.i32, shape=())
 
     @ti.kernel
     def func():
@@ -44,10 +44,10 @@ def test_compare_basics():
 @ti.require(ti.extension.sparse)
 @ti.all_archs
 def test_compare_equality():
-    a = ti.var(ti.i32)
+    a = ti.field(ti.i32)
     ti.root.dynamic(ti.i, 256).place(a)
-    b = ti.var(ti.i32, shape=())
-    c = ti.var(ti.i32, shape=())
+    b = ti.field(ti.i32, shape=())
+    c = ti.field(ti.i32, shape=())
 
     @ti.kernel
     def func():
@@ -84,7 +84,7 @@ def test_compare_equality():
 @ti.require(ti.extension.sparse)
 @ti.all_archs
 def test_no_duplicate_eval():
-    a = ti.var(ti.i32)
+    a = ti.field(ti.i32)
     ti.root.dynamic(ti.i, 256).place(a)
 
     @ti.kernel
@@ -97,14 +97,35 @@ def test_no_duplicate_eval():
     assert a[2]  # ti.append returns 0
 
 
+@ti.all_archs
+def test_no_duplicate_eval_func():
+    a = ti.field(ti.i32, ())
+    b = ti.field(ti.i32, ())
+
+    @ti.func
+    def why_this_foo_fail(n):
+        return ti.atomic_add(b[None], n)
+
+    def foo(n):
+        return ti.atomic_add(ti.subscript(b, None), n)
+
+    @ti.kernel
+    def func():
+        a[None] = 0 <= foo(2) < 1
+
+    func()
+    assert a[None] == 1
+    assert b[None] == 2
+
+
 @ti.require(ti.extension.sparse)
 @ti.all_archs
 def test_chain_compare():
-    a = ti.var(ti.i32)
+    a = ti.field(ti.i32)
     ti.root.dynamic(ti.i, 256).place(a)
-    b = ti.var(ti.i32, shape=())
-    c = ti.var(ti.i32, shape=())
-    d = ti.var(ti.i32, shape=())
+    b = ti.field(ti.i32, shape=())
+    c = ti.field(ti.i32, shape=())
+    d = ti.field(ti.i32, shape=())
 
     @ti.kernel
     def func():
@@ -117,51 +138,3 @@ def test_chain_compare():
     func()
     assert a[0]
     assert not a[1]
-
-
-@ti.must_throw(ti.TaichiSyntaxError)
-def test_is():
-    b = ti.var(ti.i32, shape=())
-    c = ti.var(ti.i32, shape=())
-
-    @ti.kernel
-    def func():
-        a = b is c
-
-    func()
-
-
-@ti.must_throw(ti.TaichiSyntaxError)
-def test_is_not():
-    b = ti.var(ti.i32, shape=())
-    c = ti.var(ti.i32, shape=())
-
-    @ti.kernel
-    def func():
-        a = b is not c
-
-    func()
-
-
-@ti.must_throw(ti.TaichiSyntaxError)
-def test_in():
-    b = ti.var(ti.i32, shape=())
-    c = ti.var(ti.i32, shape=())
-
-    @ti.kernel
-    def func():
-        a = b in c
-
-    func()
-
-
-@ti.must_throw(ti.TaichiSyntaxError)
-def test_not_in():
-    b = ti.var(ti.i32, shape=())
-    c = ti.var(ti.i32, shape=())
-
-    @ti.kernel
-    def func():
-        a = b not in c
-
-    func()

@@ -1,28 +1,6 @@
 import taichi
-
 import sys
-import datetime
-import platform
-import random
 import copy
-
-
-def get_os_name():
-    name = platform.platform()
-    # in python 3.8, platform.platform() uses mac_ver() on macOS
-    # it will return 'macOS-XXXX' instead of 'Darwin-XXXX'
-    if name.lower().startswith('darwin') or name.lower().startswith('macos'):
-        return 'osx'
-    elif name.lower().startswith('windows'):
-        return 'win'
-    elif name.lower().startswith('linux'):
-        return 'linux'
-    assert False, "Unknown platform name %s" % name
-
-
-def get_unique_task_id():
-    return datetime.datetime.now().strftime('task-%Y-%m-%d-%H-%M-%S-r') + (
-        '%05d' % random.randint(0, 10000))
 
 
 def config_from_dict(args):
@@ -37,7 +15,7 @@ def config_from_dict(args):
     return ti_core.config_from_dict(d)
 
 
-def veci(*args):
+def core_veci(*args):
     from taichi.core import ti_core
     if isinstance(args[0], ti_core.Vector2i):
         return args[0]
@@ -56,7 +34,7 @@ def veci(*args):
         assert False, type(args[0])
 
 
-def vec(*args):
+def core_vec(*args):
     from taichi.core import ti_core
     if isinstance(args[0], ti_core.Vector2f):
         return args[0]
@@ -132,14 +110,85 @@ def get_line_number(asc=0):
     return inspect.stack()[1 + asc][2]
 
 
+# The builtin `warnings` module is unreliable as it may be supressed
+# by other packages, e.g. IPython.
+def warning(msg, type=UserWarning, stacklevel=1):
+    from colorama import Fore, Back, Style
+    import traceback
+    import taichi as ti
+    s = traceback.extract_stack()[:-stacklevel]
+    raw = ''.join(traceback.format_list(s))
+    print(Fore.YELLOW + Style.BRIGHT, end='')
+    print(f'{type.__name__}: {msg}')
+    print(f'\n{raw}')
+    print(Style.RESET_ALL, end='')
+
+
+def deprecated(old, new, type=DeprecationWarning):
+    '''
+    Announce a pending deprecation with an API wrapper, usage:
+
+    @deprecated('ti.sqr(x)', 'x**2')
+    def sqr(x):
+        return x**2
+    '''
+    import functools
+
+    def decorator(foo):
+        @functools.wraps(foo)
+        def wrapped(*args, **kwargs):
+            _taichi_skip_traceback = 1
+            msg = f'{old} is deprecated, please use {new} instead'
+            try:
+                import locale
+                if 'zh' in locale.getdefaultlocale()[0]:
+                    msg += f'\n{old} 已被废除，请使用 {new} 来替换'
+            except:
+                pass
+            warning(msg, type, stacklevel=2)
+            return foo(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
+
+
+def obsolete(old, new):
+    '''
+    Mark API as obsolete, with no API wrapper. E.g.,
+
+    sqr = obsolete('ti.sqr(x)', 'x**2')
+    '''
+    def wrapped(*args, **kwargs):
+        _taichi_skip_traceback = 1
+        msg = f'{old} is obsolete. Please use {new} instead'
+        try:
+            import locale
+            if 'zh' in locale.getdefaultlocale()[0]:
+                msg += f'\n{old} 已被彻底废除，请使用 {new} 来替换'
+        except:
+            pass
+        raise SyntaxError(msg)
+
+    return wrapped
+
+
+def get_traceback(stacklevel=1):
+    import traceback
+    s = traceback.extract_stack()[:-1 - stacklevel]
+    return ''.join(traceback.format_list(s))
+
+
 def get_logging(name):
     def logger(msg, *args, **kwargs):
         # Python inspection takes time (~0.1ms) so avoid it as much as possible
         if taichi.ti_core.logging_effective(name):
+            import os
             msg_formatted = msg.format(*args, **kwargs)
             func = getattr(taichi.ti_core, name)
-            frame = inspect.currentframe().f_back.f_back
+            frame = inspect.currentframe().f_back
             file_name, lineno, func_name, _, _ = inspect.getframeinfo(frame)
+            file_name = os.path.basename(file_name)
             msg = f'[{file_name}:{func_name}@{lineno}] {msg_formatted}'
             func(msg)
 
@@ -184,3 +233,69 @@ def set_logging_level(level):
 
 def set_gdb_trigger(on=True):
     taichi.ti_core.set_core_trigger_gdb_when_crash(on)
+
+
+def print_profile_info():
+    taichi.ti_core.print_profile_info()
+
+
+@deprecated('ti.vec(x, y)', 'ti.core_vec(x, y)')
+def vec(*args, **kwargs):
+    return core_vec(*args, **kwargs)
+
+
+@deprecated('ti.veci(x, y)', 'ti.core_veci(x, y)')
+def veci(*args, **kwargs):
+    return core_veci(*args, **kwargs)
+
+
+def dump_dot(filepath=None, rankdir=None, embed_states_threshold=0):
+    from taichi.core import ti_core
+    d = ti_core.dump_dot(rankdir, embed_states_threshold)
+    if filepath is not None:
+        with open(filepath, 'w') as fh:
+            fh.write(d)
+    return d
+
+
+def dot_to_pdf(dot, filepath):
+    assert filepath.endswith('.pdf')
+    import subprocess
+    p = subprocess.Popen(['dot', '-Tpdf'],
+                         stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE)
+    pdf_contents = p.communicate(input=dot.encode())[0]
+    with open(filepath, 'wb') as fh:
+        fh.write(pdf_contents)
+
+
+def get_kernel_stats():
+    from taichi.core import ti_core
+    return ti_core.get_kernel_stats()
+
+
+__all__ = [
+    'vec',
+    'veci',
+    'core_vec',
+    'core_veci',
+    'deprecated',
+    'dump_dot',
+    'dot_to_pdf',
+    'obsolete',
+    'get_kernel_stats',
+    'get_traceback',
+    'set_gdb_trigger',
+    'print_profile_info',
+    'set_logging_level',
+    'info',
+    'warn',
+    'error',
+    'debug',
+    'trace',
+    'INFO',
+    'WARN',
+    'ERROR',
+    'DEBUG',
+    'TRACE',
+]

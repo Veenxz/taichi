@@ -3,7 +3,7 @@ import numpy as np
 
 
 def with_data_type(dt):
-    val = ti.var(ti.i32)
+    val = ti.field(ti.i32)
 
     n = 4
 
@@ -49,7 +49,7 @@ def test_numpy_i64():
 
 @ti.all_archs
 def test_numpy_2d():
-    val = ti.var(ti.i32)
+    val = ti.field(ti.i32)
 
     n = 4
     m = 7
@@ -77,7 +77,7 @@ def test_numpy_2d():
 
 @ti.all_archs
 def test_numpy_2d_transpose():
-    val = ti.var(ti.i32)
+    val = ti.field(ti.i32)
 
     n = 8
     m = 8
@@ -104,7 +104,7 @@ def test_numpy_2d_transpose():
 
 @ti.all_archs
 def test_numpy_3d():
-    val = ti.var(ti.i32)
+    val = ti.field(ti.i32)
 
     n = 4
     m = 7
@@ -134,9 +134,9 @@ def test_numpy_3d():
                 assert a[i, j, k] == i * j * (k + 1) + i + j + k * 2
 
 
-@ti.must_throw(AssertionError)
-def test_numpy_3d():
-    val = ti.var(ti.i32)
+@ti.must_throw(IndexError)
+def test_numpy_3d_error():
+    val = ti.field(ti.i32)
 
     n = 4
     m = 7
@@ -180,5 +180,16 @@ def test_numpy_multiple_external_arrays():
 
 @ti.must_throw(AssertionError)
 def test_index_mismatch():
-    val = ti.var(ti.i32, shape=(1, 2, 3))
+    val = ti.field(ti.i32, shape=(1, 2, 3))
     val[0, 0] = 1
+
+
+@ti.all_archs
+def test_numpy_zero():
+    @ti.kernel
+    def test_numpy(arr: ti.ext_arr()):
+        pass
+
+    test_numpy(np.empty(shape=(0), dtype=np.int32))
+    test_numpy(np.empty(shape=(0, 5), dtype=np.int32))
+    test_numpy(np.empty(shape=(5, 0), dtype=np.int32))

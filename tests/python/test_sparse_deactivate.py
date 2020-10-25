@@ -1,16 +1,15 @@
 import taichi as ti
 
 
-@ti.archs_support_sparse
+@ti.test(require=ti.extension.sparse)
 def test_pointer():
-    x = ti.var(ti.f32)
-    s = ti.var(ti.i32)
+    x = ti.field(ti.f32)
+    s = ti.field(ti.i32, shape=())
 
     n = 16
 
     ptr = ti.root.pointer(ti.i, n)
     ptr.dense(ti.i, n).place(x)
-    ti.root.place(s)
 
     s[None] = 0
 
@@ -34,9 +33,44 @@ def test_pointer():
     assert s[None] == 16
 
 
-@ti.archs_support_sparse
+@ti.test(require=ti.extension.sparse)
+def test_pointer1():
+    x = ti.field(ti.f32)
+    s = ti.field(ti.i32)
+
+    n = 16
+
+    ptr = ti.root.pointer(ti.i, n)
+    ptr.dense(ti.i, n).place(x)
+    ti.root.place(s)
+
+    s[None] = 0
+
+    @ti.kernel
+    def func():
+        for i in x:
+            s[None] += 1
+
+    x[0] = 1
+    x[19] = 1
+    x[20] = 1
+    x[45] = 1
+    func()
+    assert s[None] == 48
+
+    @ti.kernel
+    def deactivate():
+        ti.deactivate(ptr, 4)
+
+    deactivate()
+    s[None] = 0
+    func()
+    assert s[None] == 32
+
+
+@ti.test(require=ti.extension.sparse)
 def test_pointer2():
-    x = ti.var(ti.f32)
+    x = ti.field(ti.f32)
 
     n = 16
 
@@ -72,10 +106,10 @@ def test_pointer2():
             assert x[i] == 10.0
 
 
-@ti.archs_support_sparse
+@ti.test(require=ti.extension.sparse)
 def test_pointer3():
-    x = ti.var(ti.f32)
-    x_temp = ti.var(ti.f32)
+    x = ti.field(ti.f32)
+    x_temp = ti.field(ti.f32)
 
     n = 16
 
@@ -134,10 +168,10 @@ def test_pointer3():
                     assert x[i, j] == i + j
 
 
-@ti.archs_support_sparse
+@ti.test(require=ti.extension.sparse)
 def test_dynamic():
-    x = ti.var(ti.i32)
-    s = ti.var(ti.i32)
+    x = ti.field(ti.i32)
+    s = ti.field(ti.i32)
 
     n = 16
 

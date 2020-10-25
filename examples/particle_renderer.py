@@ -9,18 +9,18 @@ ti.init(arch=ti.cuda, device_memory_GB=4)
 
 res = 1280, 720
 num_spheres = 1024
-color_buffer = ti.Vector(3, dt=ti.f32)
-bbox = ti.Vector(3, dt=ti.f32, shape=2)
-grid_density = ti.var(dt=ti.i32)
-voxel_has_particle = ti.var(dt=ti.i32)
+color_buffer = ti.Vector.field(3, dtype=ti.f32)
+bbox = ti.Vector.field(3, dtype=ti.f32, shape=2)
+grid_density = ti.field(dtype=ti.i32)
+voxel_has_particle = ti.field(dtype=ti.i32)
 max_ray_depth = 4
 use_directional_light = True
 
-particle_x = ti.Vector(3, dt=ti.f32)
-particle_v = ti.Vector(3, dt=ti.f32)
-particle_color = ti.Vector(3, dt=ti.f32)
-pid = ti.var(ti.i32)
-num_particles = ti.var(ti.i32, shape=())
+particle_x = ti.Vector.field(3, dtype=ti.f32)
+particle_v = ti.Vector.field(3, dtype=ti.f32)
+particle_color = ti.Vector.field(3, dtype=ti.f32)
+pid = ti.field(ti.i32)
+num_particles = ti.field(ti.i32, shape=())
 
 fov = 0.23
 dist_limit = 100
@@ -53,22 +53,18 @@ max_num_particles = 1024 * 1024 * 4
 
 assert sphere_radius * 2 * particle_grid_res < 1
 
+ti.root.dense(ti.ij, (res[0] // 8, res[1] // 8)).dense(ti.ij,
+                                                       8).place(color_buffer)
 
-@ti.layout
-def buffers():
-    ti.root.dense(ti.ij,
-                  (res[0] // 8, res[1] // 8)).dense(ti.ij,
-                                                    8).place(color_buffer)
+ti.root.dense(ti.ijk, 2).dense(ti.ijk, particle_grid_res // 8).dense(
+    ti.ijk, 8).place(voxel_has_particle)
+ti.root.dense(ti.ijk, 4).pointer(ti.ijk, particle_grid_res // 8).dense(
+    ti.ijk, 8).dynamic(ti.l, max_num_particles_per_cell, 512).place(pid)
 
-    ti.root.dense(ti.ijk, 2).dense(ti.ijk, particle_grid_res // 8).dense(
-        ti.ijk, 8).place(voxel_has_particle)
-    ti.root.dense(ti.ijk, 4).pointer(ti.ijk, particle_grid_res // 8).dense(
-        ti.ijk, 8).dynamic(ti.l, max_num_particles_per_cell, 512).place(pid)
-
-    ti.root.dense(ti.l, max_num_particles).place(particle_x, particle_v,
-                                                 particle_color)
-    ti.root.dense(ti.ijk, grid_resolution // 8).dense(ti.ijk,
-                                                      8).place(grid_density)
+ti.root.dense(ti.l, max_num_particles).place(particle_x, particle_v,
+                                             particle_color)
+ti.root.dense(ti.ijk, grid_resolution // 8).dense(ti.ijk,
+                                                  8).place(grid_density)
 
 
 @ti.func

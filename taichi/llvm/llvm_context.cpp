@@ -12,12 +12,9 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
-#if LLVM_VERSION_MAJOR >= 10
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicsNVPTX.h"
-#endif
 #include "llvm/IR/LLVMContext.h"
-#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
@@ -29,6 +26,10 @@
 #include "llvm/Transforms/Scalar/GVN.h"
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/IPO.h"
+#include "llvm/Transforms/IPO/Internalize.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
+#include "llvm/Pass.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/Demangle/Demangle.h"
@@ -38,11 +39,17 @@
 #include "taichi/jit/jit_session.h"
 #include "taichi/common/task.h"
 #include "taichi/util/environ_config.h"
+#include "llvm_context.h"
+
 #ifdef _WIN32
 // Travis CI seems doesn't support <filesystem>...
 #include <filesystem>
 #else
 #include <unistd.h>
+#endif
+
+#if defined(TI_WITH_CUDA)
+#include "taichi/backends/cuda/cuda_context.h"
 #endif
 
 TLANG_NAMESPACE_BEGIN
@@ -80,25 +87,25 @@ TaichiLLVMContext::TaichiLLVMContext(Arch arch) : arch(arch) {
 
 llvm::Type *TaichiLLVMContext::get_data_type(DataType dt) {
   auto ctx = get_this_thread_context();
-  if (dt == DataType::i32) {
+  if (dt->is_primitive(PrimitiveTypeID::i32)) {
     return llvm::Type::getInt32Ty(*ctx);
-  } else if (dt == DataType::i8) {
+  } else if (dt->is_primitive(PrimitiveTypeID::i8)) {
     return llvm::Type::getInt8Ty(*ctx);
-  } else if (dt == DataType::i16) {
+  } else if (dt->is_primitive(PrimitiveTypeID::i16)) {
     return llvm::Type::getInt16Ty(*ctx);
-  } else if (dt == DataType::i64) {
+  } else if (dt->is_primitive(PrimitiveTypeID::i64)) {
     return llvm::Type::getInt64Ty(*ctx);
-  } else if (dt == DataType::f32) {
+  } else if (dt->is_primitive(PrimitiveTypeID::f32)) {
     return llvm::Type::getFloatTy(*ctx);
-  } else if (dt == DataType::f64) {
+  } else if (dt->is_primitive(PrimitiveTypeID::f64)) {
     return llvm::Type::getDoubleTy(*ctx);
-  } else if (dt == DataType::u8) {
+  } else if (dt->is_primitive(PrimitiveTypeID::u8)) {
     return llvm::Type::getInt8Ty(*ctx);
-  } else if (dt == DataType::u16) {
+  } else if (dt->is_primitive(PrimitiveTypeID::u16)) {
     return llvm::Type::getInt16Ty(*ctx);
-  } else if (dt == DataType::u32) {
+  } else if (dt->is_primitive(PrimitiveTypeID::u32)) {
     return llvm::Type::getInt32Ty(*ctx);
-  } else if (dt == DataType::u64) {
+  } else if (dt->is_primitive(PrimitiveTypeID::u64)) {
     return llvm::Type::getInt64Ty(*ctx);
   } else {
     TI_INFO(data_type_name(dt));
@@ -171,15 +178,18 @@ void compile_runtime_bitcode(Arch arch) {
         return;
       }
     }
-    auto clang =
-        find_existing_command({"clang-7", "clang-8", "clang-9", "clang"});
+    auto clang = find_existing_command(
+        {"clang-7", "clang-8", "clang-9", "clang-10", "clang"});
     TI_ASSERT(command_exist("llvm-as"));
     TI_TRACE("Compiling runtime module bitcode...");
-    std::string macro = fmt::format(" -D ARCH_{} ", arch_name(arch));
+
+    std::string cuda_compute_capability = "0";
+
+    std::string arch_macro = fmt::format(" -D ARCH_{}", arch_name(arch));
     auto cmd = fmt::format(
         "{} -S {}runtime.cpp -o {}runtime.ll -fno-exceptions "
         "-emit-llvm -std=c++17 {} -I {}",
-        clang, runtime_src_folder, runtime_folder, macro, get_repo_dir());
+        clang, runtime_src_folder, runtime_folder, arch_macro, get_repo_dir());
     int ret = std::system(cmd.c_str());
     if (ret) {
       TI_ERROR("LLVMRuntime compilation failed.");
@@ -344,14 +354,29 @@ std::unique_ptr<llvm::Module> TaichiLLVMContext::clone_runtime_module() {
       data->runtime_module = module_from_bitcode_file(
           fmt::format("{}/{}", get_runtime_dir(), get_runtime_fn(arch)), ctx);
     }
+
     if (arch == Arch::cuda) {
       auto &runtime_module = data->runtime_module;
       runtime_module->setTargetTriple("nvptx64-nvidia-cuda");
 
+#if defined(TI_WITH_CUDA)
+      auto func = runtime_module->getFunction("cuda_compute_capability");
+      TI_ERROR_UNLESS(func, "Function cuda_compute_capability not found");
+      func->deleteBody();
+      auto bb = llvm::BasicBlock::Create(*ctx, "entry", func);
+      IRBuilder<> builder(*ctx);
+      builder.SetInsertPoint(bb);
+      builder.CreateRet(
+          get_constant(CUDAContext::get_instance().get_compute_capability()));
+      TaichiLLVMContext::force_inline(func);
+#endif
+
       auto patch_intrinsic = [&](std::string name, Intrinsic::ID intrin,
                                  bool ret = true,
-                                 std::vector<Type *> types = {}) {
+                                 std::vector<llvm::Type *> types = {},
+                                 std::vector<llvm::Value *> extra_args = {}) {
         auto func = runtime_module->getFunction(name);
+        TI_ERROR_UNLESS(func, "Function {} not found", name);
         func->deleteBody();
         auto bb = llvm::BasicBlock::Create(*ctx, "entry", func);
         IRBuilder<> builder(*ctx);
@@ -359,6 +384,7 @@ std::unique_ptr<llvm::Module> TaichiLLVMContext::clone_runtime_module() {
         std::vector<llvm::Value *> args;
         for (auto &arg : func->args())
           args.push_back(&arg);
+        args.insert(args.end(), extra_args.begin(), extra_args.end());
         if (ret) {
           builder.CreateRet(builder.CreateIntrinsic(intrin, types, args));
         } else {
@@ -385,35 +411,47 @@ std::unique_ptr<llvm::Module> TaichiLLVMContext::clone_runtime_module() {
       };
 
       patch_intrinsic("thread_idx", Intrinsic::nvvm_read_ptx_sreg_tid_x);
+      patch_intrinsic("cuda_clock_i64", Intrinsic::nvvm_read_ptx_sreg_clock64);
       patch_intrinsic("block_idx", Intrinsic::nvvm_read_ptx_sreg_ctaid_x);
       patch_intrinsic("block_dim", Intrinsic::nvvm_read_ptx_sreg_ntid_x);
       patch_intrinsic("grid_dim", Intrinsic::nvvm_read_ptx_sreg_nctaid_x);
       patch_intrinsic("block_barrier", Intrinsic::nvvm_barrier0, false);
+      patch_intrinsic("warp_barrier", Intrinsic::nvvm_bar_warp_sync, false);
       patch_intrinsic("block_memfence", Intrinsic::nvvm_membar_cta, false);
       patch_intrinsic("grid_memfence", Intrinsic::nvvm_membar_gl, false);
       patch_intrinsic("system_memfence", Intrinsic::nvvm_membar_sys, false);
+
+      patch_intrinsic("cuda_ballot", Intrinsic::nvvm_vote_ballot);
+      patch_intrinsic("cuda_ballot_sync", Intrinsic::nvvm_vote_ballot_sync);
+
+      patch_intrinsic("cuda_shfl_down_sync_i32",
+                      Intrinsic::nvvm_shfl_sync_down_i32);
+
+      patch_intrinsic("cuda_shfl_down_sync_i32",
+                      Intrinsic::nvvm_shfl_sync_down_i32);
+
+      patch_intrinsic("cuda_match_any_sync_i32",
+                      Intrinsic::nvvm_match_any_sync_i32);
+
+      // LLVM 10.0.0 seems to have a bug on this intrinsic function
+      /*
+      patch_intrinsic("cuda_match_any_sync_i64",
+                      Intrinsic::nvvm_match_any_sync_i64);
+                      */
+
+      patch_intrinsic("ctlz_i32", Intrinsic::ctlz, true,
+                      {llvm::Type::getInt32Ty(*ctx)}, {get_constant(false)});
+      patch_intrinsic("cttz_i32", Intrinsic::cttz, true,
+                      {llvm::Type::getInt32Ty(*ctx)}, {get_constant(false)});
 
       patch_atomic_add("atomic_add_i32", llvm::AtomicRMWInst::Add);
 
       patch_atomic_add("atomic_add_i64", llvm::AtomicRMWInst::Add);
 
-#if LLVM_VERSION_MAJOR >= 10
       patch_atomic_add("atomic_add_f32", llvm::AtomicRMWInst::FAdd);
 
       patch_atomic_add("atomic_add_f64", llvm::AtomicRMWInst::FAdd);
-#else
-      patch_intrinsic(
-          "atomic_add_f32", Intrinsic::nvvm_atomic_load_add_f32, true,
-          {llvm::PointerType::get(get_data_type(DataType::f32), 0)});
 
-      patch_intrinsic(
-          "atomic_add_f64", Intrinsic::nvvm_atomic_load_add_f64, true,
-          {llvm::PointerType::get(get_data_type(DataType::f64), 0)});
-#endif
-
-      // patch_intrinsic("sync_warp", Intrinsic::nvvm_bar_warp_sync, false);
-      // patch_intrinsic("warp_ballot", Intrinsic::nvvm_vote_ballot, false);
-      // patch_intrinsic("warp_active_mask", Intrinsic::nvvm_membar_cta, false);
       patch_intrinsic("block_memfence", Intrinsic::nvvm_membar_cta, false);
 
       link_module_with_cuda_libdevice(data->runtime_module);
@@ -522,17 +560,17 @@ void TaichiLLVMContext::set_struct_module(
 template <typename T>
 llvm::Value *TaichiLLVMContext::get_constant(DataType dt, T t) {
   auto ctx = get_this_thread_context();
-  if (dt == DataType::f32) {
+  if (dt->is_primitive(PrimitiveTypeID::f32)) {
     return llvm::ConstantFP::get(*ctx, llvm::APFloat((float32)t));
-  } else if (dt == DataType::f64) {
+  } else if (dt->is_primitive(PrimitiveTypeID::f64)) {
     return llvm::ConstantFP::get(*ctx, llvm::APFloat((float64)t));
-  } else if (dt == DataType::i32) {
+  } else if (dt->is_primitive(PrimitiveTypeID::i32)) {
     return llvm::ConstantInt::get(*ctx, llvm::APInt(32, t, true));
-  } else if (dt == DataType::u32) {
+  } else if (dt->is_primitive(PrimitiveTypeID::u32)) {
     return llvm::ConstantInt::get(*ctx, llvm::APInt(32, t, false));
-  } else if (dt == DataType::i64) {
+  } else if (dt->is_primitive(PrimitiveTypeID::i64)) {
     return llvm::ConstantInt::get(*ctx, llvm::APInt(64, t, true));
-  } else if (dt == DataType::u64) {
+  } else if (dt->is_primitive(PrimitiveTypeID::u64)) {
     return llvm::ConstantInt::get(*ctx, llvm::APInt(64, t, false));
   } else {
     TI_NOT_IMPLEMENTED
@@ -619,8 +657,9 @@ JITModule *TaichiLLVMContext::add_module(std::unique_ptr<llvm::Module> module) {
   return jit->add_module(std::move(module));
 }
 
-void TaichiLLVMContext::mark_function_as_cuda_kernel(llvm::Function *func) {
-  auto ctx = get_this_thread_context();
+void TaichiLLVMContext::insert_nvvm_annotation(llvm::Function *func,
+                                               std::string key,
+                                               int val) {
   /*******************************************************************
   Example annotation from llvm PTX doc:
 
@@ -633,13 +672,10 @@ void TaichiLLVMContext::mark_function_as_cuda_kernel(llvm::Function *func) {
                float addrspace(1)*,
                float addrspace(1)*)* @kernel, !"kernel", i32 1}
   *******************************************************************/
-
-  // Mark kernel function as a CUDA __global__ function
-  // Add the nvvm annotation that it is considered a kernel function.
-
+  auto ctx = get_this_thread_context();
   llvm::Metadata *md_args[] = {llvm::ValueAsMetadata::get(func),
-                               MDString::get(*ctx, "kernel"),
-                               llvm::ValueAsMetadata::get(get_constant(1))};
+                               MDString::get(*ctx, key),
+                               llvm::ValueAsMetadata::get(get_constant(val))};
 
   MDNode *md_node = MDNode::get(*ctx, md_args);
 
@@ -648,18 +684,40 @@ void TaichiLLVMContext::mark_function_as_cuda_kernel(llvm::Function *func) {
       ->addOperand(md_node);
 }
 
+void TaichiLLVMContext::mark_function_as_cuda_kernel(llvm::Function *func,
+                                                     int block_dim) {
+  // Mark kernel function as a CUDA __global__ function
+  // Add the nvvm annotation that it is considered a kernel function.
+  insert_nvvm_annotation(func, "kernel", 1);
+  if (block_dim != 0) {
+    // CUDA launch bounds
+    insert_nvvm_annotation(func, "maxntidx", block_dim);
+    insert_nvvm_annotation(func, "minctasm", 2);
+  }
+}
+
 void TaichiLLVMContext::eliminate_unused_functions(
     llvm::Module *module,
     std::function<bool(const std::string &)> export_indicator) {
   TI_AUTO_PROF
   using namespace llvm;
-  legacy::PassManager manager;
-  ModuleAnalysisManager ana;
-  manager.add(createInternalizePass([&](const GlobalValue &val) -> bool {
+  TI_ASSERT(module);
+  if (false) {
+    // temporary fix for now to make LLVM 8 work with CUDA
+    // TODO: recover this when it's time
+    if (llvm::verifyModule(*module, &llvm::errs())) {
+      TI_ERROR("Module broken\n");
+    }
+  }
+  llvm::ModulePassManager manager;
+  llvm::ModuleAnalysisManager ana;
+  llvm::PassBuilder pb;
+  pb.registerModuleAnalyses(ana);
+  manager.addPass(llvm::InternalizePass([&](const GlobalValue &val) -> bool {
     return export_indicator(val.getName());
   }));
-  manager.add(createGlobalDCEPass());
-  manager.run(*module);
+  manager.addPass(GlobalDCEPass());
+  manager.run(*module, ana);
 }
 
 TaichiLLVMContext::ThreadLocalData *TaichiLLVMContext::get_this_thread_data() {
@@ -718,7 +776,7 @@ template llvm::Value *TaichiLLVMContext::get_constant(unsigned long t);
 
 auto make_slim_libdevice = [](const std::vector<std::string> &args) {
   TI_ASSERT_INFO(args.size() == 1,
-                 "Usage: ti run make_slim_libdevice [libdevice.X.bc file]");
+                 "Usage: ti task make_slim_libdevice [libdevice.X.bc file]");
 
   auto ctx = std::make_unique<llvm::LLVMContext>();
   auto libdevice_module = module_from_bitcode_file(args[0], ctx.get());

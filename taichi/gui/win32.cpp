@@ -67,7 +67,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd,
   auto dc = GetDC(hwnd);
   auto gui = gui_from_hwnd[hwnd];
   using namespace taichi;
-  int x, y;
+  POINT p{};
   switch (uMsg) {
     case WM_LBUTTONDOWN:
       gui->mouse_event(
@@ -98,11 +98,26 @@ LRESULT CALLBACK WindowProc(HWND hwnd,
           GUI::KeyEvent{GUI::KeyEvent::Type::release, "RMB", gui->cursor_pos});
       break;
     case WM_MOUSEMOVE:
-      x = GET_X_LPARAM(lParam);
-      y = GET_Y_LPARAM(lParam);
-      gui->set_mouse_pos(x, gui->height - 1 - y);
+      p = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+      gui->set_mouse_pos(p.x, gui->height - 1 - p.y);
       gui->mouse_event(
           GUI::MouseEvent{GUI::MouseEvent::Type::move, gui->cursor_pos});
+      break;
+    case WM_MOUSEWHEEL:
+      p = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+      ScreenToClient(hwnd, &p);
+      gui->set_mouse_pos(p.x, gui->height - 1 - p.y);
+      gui->key_events.push_back(
+          GUI::KeyEvent{GUI::KeyEvent::Type::move, "Wheel", gui->cursor_pos,
+                        Vector2i{0, GET_WHEEL_DELTA_WPARAM(wParam)}});
+      break;
+    case WM_MOUSEHWHEEL:
+      p = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+      ScreenToClient(hwnd, &p);
+      gui->set_mouse_pos(p.x, gui->height - 1 - p.y);
+      gui->key_events.push_back(
+          GUI::KeyEvent{GUI::KeyEvent::Type::move, "Wheel", gui->cursor_pos,
+                        Vector2i{GET_WHEEL_DELTA_WPARAM(wParam), 0}});
       break;
     case WM_PAINT:
       break;
@@ -146,23 +161,38 @@ void GUI::create_window() {
 
   RegisterClass(&wc);
 
+  RECT window_rect;
+  window_rect.left = 0;
+  window_rect.right = width;
+  window_rect.top = 0;
+  window_rect.bottom = height;
+
+  AdjustWindowRect(&window_rect, WS_OVERLAPPEDWINDOW, false);
+
   hwnd = CreateWindowEx(0,           // Optional window styles.
                         CLASS_NAME,  // Window class
                         std::wstring(window_name.begin(), window_name.end())
                             .data(),          // Window text
                         WS_OVERLAPPEDWINDOW,  // Window style
                         // Size and position
-                        CW_USEDEFAULT, CW_USEDEFAULT, width + 16, height + 32,
+                        CW_USEDEFAULT, CW_USEDEFAULT,
+                        window_rect.right - window_rect.left,
+                        window_rect.bottom - window_rect.top,
                         NULL,                // Parent window
                         NULL,                // Menu
                         GetModuleHandle(0),  // Instance handle
                         NULL                 // Additional application data
   );
-
+  TI_ERROR_IF(hwnd == NULL, "Window creation failed");
   gui_from_hwnd[hwnd] = this;
 
-  if (hwnd == NULL) {
-    TI_ERROR("Window creation failed");
+  if (fullscreen) {
+    // https://www.cnblogs.com/lidabo/archive/2012/07/17/2595452.html
+    LONG style = GetWindowLong(hwnd, GWL_STYLE);
+    style &= ~WS_CAPTION & ~WS_SIZEBOX;
+    SetWindowLong(hwnd, GWL_STYLE, style);
+    SetWindowPos(hwnd, NULL, 0, 0, GetSystemMetrics(SM_CXSCREEN),
+                 GetSystemMetrics(SM_CYSCREEN), SWP_NOZORDER);
   }
 
   ShowWindow(hwnd, SW_SHOWDEFAULT);
@@ -173,18 +203,21 @@ void GUI::create_window() {
 
 void GUI::redraw() {
   UpdateWindow(hwnd);
-  // http:// www.cplusplus.com/reference/cstdlib/calloc/
-  for (int i = 0; i < width; i++) {
-    for (int j = 0; j < height; j++) {
-      auto c = reinterpret_cast<unsigned char *>(data + (j * width) + i);
-      auto d = canvas->img[i][height - j - 1];
-      c[0] = uint8(clamp(int(d[2] * 255.0_f), 0, 255));
-      c[1] = uint8(clamp(int(d[1] * 255.0_f), 0, 255));
-      c[2] = uint8(clamp(int(d[0] * 255.0_f), 0, 255));
-      c[3] = 0;
+  if (!fast_gui) {
+    // http://www.cplusplus.com/reference/cstdlib/calloc/
+    for (int i = 0; i < width; i++) {
+      for (int j = 0; j < height; j++) {
+        auto c = reinterpret_cast<unsigned char *>(data + (j * width) + i);
+        auto d = canvas->img[i][height - j - 1];
+        c[0] = uint8(clamp(int(d[2] * 255.0_f), 0, 255));
+        c[1] = uint8(clamp(int(d[1] * 255.0_f), 0, 255));
+        c[2] = uint8(clamp(int(d[0] * 255.0_f), 0, 255));
+        c[3] = 0;
+      }
     }
   }
-  bitmap = CreateBitmap(width, height, 1, 32, (void *)data);
+  bitmap = CreateBitmap(width, height, 1, 32,
+                        fast_gui ? (void *)fast_buf : (void *)data);
   SelectObject(src, bitmap);
   BitBlt(hdc, 0, 0, width, height, src, 0, 0, SRCCOPY);
   DeleteObject(bitmap);
@@ -195,9 +228,12 @@ void GUI::set_title(std::string title) {
 }
 
 GUI::~GUI() {
-  std::free(data);
-  DeleteDC(src);
-  gui_from_hwnd.erase(hwnd);
+  if (show_gui) {
+    std::free(data);
+    DeleteDC(src);
+    DestroyWindow(hwnd);
+    gui_from_hwnd.erase(hwnd);
+  }
 }
 
 TI_NAMESPACE_END

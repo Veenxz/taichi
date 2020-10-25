@@ -3,18 +3,14 @@ import re
 import shutil
 import sys
 import ctypes
-import warnings
 from pathlib import Path
 from colorama import Fore, Back, Style
-from taichi.misc.settings import get_output_directory, get_build_directory, get_bin_directory, get_repo_directory, get_runtime_directory
-from taichi.misc.util import get_os_name, get_unique_task_id
+from .settings import *
 
 if sys.version_info[0] < 3 or sys.version_info[1] <= 5:
     print("\nPlease restart with Python 3.6+\n")
     print("Current Python version:", sys.version_info)
     exit(-1)
-
-warnings.filterwarnings('always')
 
 ti_core = None
 
@@ -30,7 +26,7 @@ def import_ti_core(tmp_dir=None):
     global ti_core
     if get_os_name() != 'win':
         old_flags = sys.getdlopenflags()
-        sys.setdlopenflags(258)  # 258 = RTLD_NOW | RTLD_GLOBAL
+        sys.setdlopenflags(2 | 8)  # RTLD_NOW | RTLD_DEEPBIND
     else:
         pyddir = os.path.join(package_root(), 'lib')
         os.environ['PATH'] += ';' + pyddir
@@ -53,13 +49,19 @@ def import_ti_core(tmp_dir=None):
         core.set_tmp_dir(locale_encode(tmp_dir))
 
 
-def locale_encode(s):
+def locale_encode(path):
     try:
         import locale
-        encoding = locale.getdefaultlocale()[1]
+        return path.encode(locale.getdefaultlocale()[1])
     except:
-        encoding = 'utf8'
-    return s.encode(encoding)
+        try:
+            import sys
+            return path.encode(sys.getfilesystemencoding())
+        except:
+            try:
+                return path.encode()
+            except:
+                return path
 
 
 def is_ci():
@@ -94,133 +96,6 @@ def print_red_bold(*args, **kwargs):
     print(Style.RESET_ALL, end='')
 
 
-def has_suffix(f, suffixes):
-    for suf in suffixes:
-        if f.endswith('.' + suf):
-            return True
-    return False
-
-
-def format_plain_text(fn):
-    formatted = ''
-    with open(fn, 'r') as f:
-        for l in f:
-            l = l.rstrip()
-            if l.find('\t') != -1:
-                print(f'Warning: found tab in {fn}. Skipping...')
-                return
-            formatted += l + '\n'
-    while len(formatted) and formatted[-1] == '\n':
-        formatted = formatted[:-1]
-    formatted += '\n'
-    with open(fn, 'w') as f:
-        f.write(formatted)
-
-
-def _find_clang_format_bin():
-    candidates = ['clang-format-6.0', 'clang-format']
-    result = None
-
-    import subprocess as sp
-    for c in candidates:
-        try:
-            if sp.run([c, '--version'], stdout=sp.DEVNULL,
-                      stderr=sp.DEVNULL).returncode == 0:
-                result = c
-                break
-        except:
-            pass
-    import colorama
-    colorama.init()
-    if result is None:
-        print(Fore.YELLOW +
-              'Did not find any clang-format executable, skipping C++ files',
-              file=sys.stderr)
-    else:
-        print('C++ formatter: {}{}'.format(Fore.GREEN, result))
-    print(Style.RESET_ALL)
-    return result
-
-
-def format(all=False, diff=None):
-    import os
-    import taichi as tc
-    from yapf.yapflib.yapf_api import FormatFile
-    repo = get_repo()
-
-    if all:
-        directories = [
-            'taichi', 'tests', 'examples', 'misc', 'python', 'benchmarks',
-            'docs', 'misc'
-        ]
-        files = []
-        for d in directories:
-            files += list(
-                Path(os.path.join(tc.get_repo_directory(), d)).rglob('*'))
-    else:
-        if diff is None:
-
-            def find_diff_or_empty(s):
-                try:
-                    return repo.index.diff(s)
-                except:
-                    return []
-
-            # TODO(#628): Have a way to customize the repo names, in order to
-            # support noncanonical namings.
-            #
-            # Finds all modified files from upstream/master to working tree
-            # 1. diffs between the index and upstream/master. Also inclulde
-            # origin/master for repo owners.
-            files = find_diff_or_empty('upstream/master')
-            files += find_diff_or_empty('origin/master')
-            # 2. diffs between the index and the working tree
-            # https://gitpython.readthedocs.io/en/stable/tutorial.html#obtaining-diff-information
-            files += repo.index.diff(None)
-        else:
-            files = repo.index.diff(diff)
-        files = list(
-            map(lambda x: os.path.join(tc.get_repo_directory(), x.a_path),
-                files))
-
-    files = sorted(set(map(str, files)))
-    clang_format_bin = _find_clang_format_bin()
-    print('Code formatting ...')
-    for fn in files:
-        if not os.path.exists(fn):
-            continue
-        if os.path.isdir(fn):
-            continue
-        if fn.find('.pytest_cache') != -1:
-            continue
-        if fn.find('docs/build/') != -1:
-            continue
-        if re.match(r'.*examples\/[a-z_]+\d\d+\.py$', fn):
-            print(f'Skipping example file {fn}...')
-            continue
-        if fn.endswith('.py'):
-            print('Formatting "{}"'.format(fn))
-            FormatFile(fn,
-                       in_place=True,
-                       style_config=os.path.join(tc.get_repo_directory(),
-                                                 'misc', '.style.yapf'))
-        elif clang_format_bin and has_suffix(fn, ['cpp', 'h', 'cu', 'cuh']):
-            print('Formatting "{}"'.format(fn))
-            os.system('{} -i -style=file {}'.format(clang_format_bin, fn))
-        elif has_suffix(fn, ['txt', 'md', 'rst', 'cfg', 'll', 'ptx']):
-            print('Formatting "{}"'.format(fn))
-            format_plain_text(fn)
-        elif has_suffix(fn, [
-                'pyc', 'png', 'jpg', 'bmp', 'gif', 'gitignore', 'whl', 'mp4',
-                'html'
-        ]):
-            pass
-        else:
-            print(f'Skipping {fn}...')
-
-    print('Formatting done!')
-
-
 create_sand_box_on_windows = True
 
 
@@ -249,19 +124,33 @@ def build():
     os.chdir(tmp_cwd)
 
 
-def prepare_sandbox(src):
-    global g_tmp_dir
-    assert os.path.exists(src)
+def check_exists(src):
+    if not os.path.exists(src):
+        raise FileNotFoundError(
+            f'File "{src}" not exist. Installation corrupted or build incomplete?'
+        )
+
+
+def prepare_sandbox():
+    '''
+    Returns a temporary directory, which will be automatically deleted on exit.
+    It may contain the taichi_core shared object or some misc. files.
+    '''
     import atexit
     import shutil
     from tempfile import mkdtemp
     tmp_dir = mkdtemp(prefix='taichi-')
     atexit.register(shutil.rmtree, tmp_dir)
     print(f'[Taichi] preparing sandbox at {tmp_dir}')
-    dest = os.path.join(tmp_dir, 'taichi_core.so')
-    shutil.copy(src, dest)
     os.mkdir(os.path.join(tmp_dir, 'runtime/'))
     return tmp_dir
+
+
+def get_unique_task_id():
+    import datetime
+    import random
+    return datetime.datetime.now().strftime('task-%Y-%m-%d-%H-%M-%S-r') + (
+        '%05d' % random.randint(0, 10000))
 
 
 if is_release():
@@ -275,7 +164,10 @@ if is_release():
             os.symlink(link_src, link_dst)
     import_ti_core()
     if get_os_name() != 'win':
-        dll = ctypes.CDLL(get_core_shared_object(), mode=ctypes.RTLD_GLOBAL)
+        dll = ctypes.CDLL(get_core_shared_object(), mode=ctypes.RTLD_LOCAL)
+        # The C backend needs a temporary directory for the generated .c and compiled .so files:
+        ti_core.set_tmp_dir(locale_encode(prepare_sandbox(
+        )))  # TODO: always allocate a tmp_dir for all situations
 
     ti_core.set_python_package_dir(package_root())
     os.makedirs(ti_core.get_repo_dir(), exist_ok=True)
@@ -286,12 +178,15 @@ else:
         os.environ['DYLD_FALLBACK_LIBRARY_PATH'] = get_runtime_directory()
         lib_path = os.path.join(bin_dir, 'libtaichi_core.dylib')
         tmp_cwd = os.getcwd()
-        tmp_dir = prepare_sandbox(lib_path)
+        tmp_dir = prepare_sandbox()
+        check_exists(lib_path)
+        shutil.copy(lib_path, os.path.join(tmp_dir, 'taichi_core.so'))
         os.chdir(tmp_dir)
         sys.path.append(tmp_dir)
         import taichi_core as ti_core
         os.chdir(tmp_cwd)
 
+    # TODO: unify importing infrastructure:
     elif get_os_name() == 'linux':
         bin_dir = get_bin_directory()
         if 'LD_LIBRARY_PATH' in os.environ:
@@ -299,9 +194,11 @@ else:
         else:
             os.environ['LD_LIBRARY_PATH'] = '/usr/lib64/'
         lib_path = os.path.join(bin_dir, 'libtaichi_core.so')
-        assert os.path.exists(lib_path)
+        check_exists(lib_path)
         tmp_cwd = os.getcwd()
-        tmp_dir = prepare_sandbox(lib_path)
+        tmp_dir = prepare_sandbox()
+        check_exists(lib_path)
+        shutil.copy(lib_path, os.path.join(tmp_dir, 'taichi_core.so'))
         os.chdir(tmp_dir)
         sys.path.append(tmp_dir)
         try:
@@ -310,16 +207,38 @@ else:
             from colorama import Fore, Back, Style
             print_red_bold("Taichi core import failed: ", end='')
             print(e)
+            print(
+                Fore.YELLOW + "check this page for possible solutions:\n"
+                "https://taichi.readthedocs.io/en/stable/install.html#troubleshooting"
+                + Fore.RESET)
             exit(-1)
         os.chdir(tmp_cwd)
 
     elif get_os_name() == 'win':
         bin_dir = get_bin_directory()
-        dll_path1 = os.path.join(bin_dir, 'RelWithDebInfo', 'taichi_core.dll')
-        dll_path2 = os.path.join(bin_dir, 'libtaichi_core.dll')
-        assert os.path.exists(dll_path1) and not os.path.exists(dll_path2)
+        dll_path_invalid = os.path.join(bin_dir, 'libtaichi_core.dll')
+        assert not os.path.exists(dll_path_invalid)
 
-        # On windows when an dll/pyd is loaded, we can not write to it any more
+        possible_folders = ['Debug', 'RelWithDebInfo', 'Release']
+        detected_dlls = []
+        for folder in possible_folders:
+            dll_path = os.path.join(bin_dir, folder, 'taichi_core.dll')
+            if os.path.exists(dll_path):
+                detected_dlls.append(dll_path)
+
+        if len(detected_dlls) == 0:
+            raise FileNotFoundError(
+                f'Cannot find Taichi core dll under {get_bin_directory()}/{possible_folders}'
+            )
+        elif len(detected_dlls) != 1:
+            print('Warning: multiple Taichi core dlls found:')
+            for dll in detected_dlls:
+                print(' ', dll)
+            print(f'Using {detected_dlls[0]}')
+
+        dll_path = detected_dlls[0]
+
+        # On windows when an dll/pyd is loaded, we cannot write to it any more
         old_wd = os.getcwd()
         os.chdir(bin_dir)
 
@@ -332,10 +251,7 @@ else:
             os.environ['PATH'] += ';' + lib_dir
 
             os.makedirs(folder)
-            if os.path.exists(dll_path1):
-                shutil.copy(dll_path1, os.path.join(folder, 'taichi_core.pyd'))
-            else:
-                shutil.copy(dll_path2, os.path.join(folder, 'taichi_core.pyd'))
+            shutil.copy(dll_path, os.path.join(folder, 'taichi_core.pyd'))
             os.environ['PATH'] += ';' + folder
             sys.path.append(folder)
         else:
@@ -367,7 +283,7 @@ def get_dll_name(name):
     elif get_os_name() == 'win':
         return 'taichi_%s.dll' % name
     else:
-        assert False, "Unknown OS"
+        raise Exception(f"Unknown OS: {get_os_name()}")
 
 
 def load_module(name, verbose=True):
@@ -453,21 +369,14 @@ def _print_taichi_header():
     else:
         header += f'version {ti_core.get_version_string()}, '
 
-    supported_archs = ['cpu']
-    if ti_core.with_cuda():
-        supported_archs.append('cuda')
-    if ti_core.with_opengl():
-        supported_archs.append('opengl')
-    if ti_core.with_metal():
-        supported_archs.append('metal')
-    if len(supported_archs) == 1:
-        supported_archs[0] = 'cpu only'
-    archs_str = ', '.join(sorted(supported_archs))
-    header += f'supported archs: [{archs_str}], '
+    llvm_version = ti_core.get_llvm_version_string()
+    header += f'llvm {llvm_version}, '
 
     commit_hash = ti_core.get_commit_hash()
     commit_hash = commit_hash[:8]
     header += f'commit {commit_hash}, '
+
+    header += f'{get_os_name()}, '
 
     py_ver = '.'.join(str(x) for x in sys.version_info[:3])
     header += f'python {py_ver}'
@@ -476,3 +385,13 @@ def _print_taichi_header():
 
 
 _print_taichi_header()
+
+__all__ = [
+    'ti_core',
+    'build',
+    'load_module',
+    'start_memory_monitoring',
+    'is_release',
+    'package_root',
+    'require_version',
+]

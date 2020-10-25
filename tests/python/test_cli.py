@@ -22,20 +22,14 @@ def patch_sys_argv_helper(custom_argv: list):
 
 def test_cli_exit_one_with_no_command_provided():
     with patch_sys_argv_helper(["ti"]):
-        with pytest.raises(SystemExit) as pytest_wrapped_err:
-            cli = TaichiMain(test_mode=True)
-            cli()
-            assert pytest_wrapped_err.type == SystemExit
-            assert pytest_wrapped_err.value.code == 1
+        cli = TaichiMain(test_mode=True)
+        assert cli() == 1
 
 
 def test_cli_exit_one_with_bogus_command_provided():
     with patch_sys_argv_helper(["ti", "bogus-command-not-registered-yet"]):
-        with pytest.raises(SystemExit) as pytest_wrapped_err:
-            cli = TaichiMain(test_mode=True)
-            cli()
-            assert pytest_wrapped_err.type == SystemExit
-            assert pytest_wrapped_err.value.code == 1
+        cli = TaichiMain(test_mode=True)
+        assert cli() == 1
 
 
 def test_cli_can_dispatch_commands_to_methods_correctly():
@@ -59,6 +53,24 @@ def test_cli_example():
         cli = TaichiMain(test_mode=True)
         args = cli()
         assert args.name == "minimal"
+
+    with patch_sys_argv_helper(["ti", "example", "-s",
+                                "minimal.py"]) as custom_argv:
+        cli = TaichiMain(test_mode=True)
+        args = cli()
+        assert args.name == "minimal" and args.save == True
+
+    with patch_sys_argv_helper(["ti", "example", "-p",
+                                "minimal.py"]) as custom_argv:
+        cli = TaichiMain(test_mode=True)
+        args = cli()
+        assert args.name == "minimal" and args.print == True
+
+    with patch_sys_argv_helper(["ti", "example", "-P",
+                                "minimal.py"]) as custom_argv:
+        cli = TaichiMain(test_mode=True)
+        args = cli()
+        assert args.name == "minimal" and args.pretty_print == True
 
 
 def test_cli_gif():
@@ -229,7 +241,14 @@ def test_cli_debug():
 
 
 def test_cli_run():
-    with patch_sys_argv_helper(["ti", "run", "test_task", "arg1",
+    with patch_sys_argv_helper(["ti", "run", "a.py"]) as custom_argv:
+        cli = TaichiMain(test_mode=True)
+        args = cli()
+        assert args.filename == "a.py"
+
+
+def test_cli_task():
+    with patch_sys_argv_helper(["ti", "task", "test_task", "arg1",
                                 "arg2"]) as custom_argv:
         cli = TaichiMain(test_mode=True)
         args = cli()

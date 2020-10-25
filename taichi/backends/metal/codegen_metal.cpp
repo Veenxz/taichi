@@ -3,10 +3,14 @@
 #include <functional>
 #include <string>
 
+#include "taichi/backends/metal/api.h"
 #include "taichi/backends/metal/constants.h"
+#include "taichi/backends/metal/env_config.h"
 #include "taichi/backends/metal/features.h"
 #include "taichi/ir/ir.h"
+#include "taichi/ir/statements.h"
 #include "taichi/ir/transforms.h"
+#include "taichi/math/arithmetic.h"
 #include "taichi/util/line_appender.h"
 
 TLANG_NAMESPACE_BEGIN
@@ -15,27 +19,36 @@ namespace {
 
 namespace shaders {
 #define TI_INSIDE_METAL_CODEGEN
+#include "taichi/backends/metal/shaders/ad_stack.metal.h"
 #include "taichi/backends/metal/shaders/helpers.metal.h"
+#include "taichi/backends/metal/shaders/print.metal.h"
 #include "taichi/backends/metal/shaders/runtime_kernels.metal.h"
 #undef TI_INSIDE_METAL_CODEGEN
 
+#include "taichi/backends/metal/shaders/print.metal.h"
 #include "taichi/backends/metal/shaders/runtime_structs.metal.h"
+
 }  // namespace shaders
 
 using BuffersEnum = KernelAttributes::Buffers;
 
 constexpr char kKernelThreadIdName[] = "utid_";        // 'u' for unsigned
 constexpr char kKernelGridSizeName[] = "ugrid_size_";  // 'u' for unsigned
+constexpr char kKernelTidInSimdgroupName[] = "utid_in_simdg_";
 constexpr char kRootBufferName[] = "root_addr";
 constexpr char kGlobalTmpsBufferName[] = "global_tmps_addr";
 constexpr char kContextBufferName[] = "ctx_addr";
 constexpr char kContextVarName[] = "kernel_ctx_";
 constexpr char kRuntimeBufferName[] = "runtime_addr";
 constexpr char kRuntimeVarName[] = "runtime_";
+constexpr char kPrintAssertBufferName[] = "print_assert_addr";
+constexpr char kPrintAllocVarName[] = "print_alloc_";
+constexpr char kAssertRecorderVarName[] = "assert_rec_";
 constexpr char kLinearLoopIndexName[] = "linear_loop_idx_";
 constexpr char kListgenElemVarName[] = "listgen_elem_";
 constexpr char kRandStateVarName[] = "rand_state_";
-constexpr char kSNodeMetaVarName[] = "sn_meta_";
+constexpr char kMemAllocVarName[] = "mem_alloc_";
+constexpr char kTlsBufferName[] = "tls_buffer_";
 
 std::string buffer_to_name(BuffersEnum b) {
   switch (b) {
@@ -47,6 +60,8 @@ std::string buffer_to_name(BuffersEnum b) {
       return kContextBufferName;
     case BuffersEnum::Runtime:
       return kRuntimeBufferName;
+    case BuffersEnum::Print:
+      return kPrintAssertBufferName;
     default:
       TI_NOT_IMPLEMENTED;
       break;
@@ -70,21 +85,29 @@ class KernelCodegen : public IRVisitor {
       Section::Kernels,
   };
 
-  struct UsedFeatures {
-    bool runtime_list_ops = false;
-  };
-
  public:
-  KernelCodegen(const std::string &mtl_kernel_prefix,
+  struct Config {
+    bool allow_simdgroup = true;
+  };
+  // TODO(k-ye): Create a Params to hold these ctor params.
+  KernelCodegen(const std::string &taichi_kernel_name,
                 const std::string &root_snode_type_name,
                 Kernel *kernel,
-                const CompiledStructs *compiled_structs)
-      : mtl_kernel_prefix_(mtl_kernel_prefix),
+                const CompiledStructs *compiled_structs,
+                PrintStringTable *print_strtab,
+                const Config &config,
+                OffloadedStmt *offloaded)
+      : mtl_kernel_prefix_(taichi_kernel_name),
         root_snode_type_name_(root_snode_type_name),
         kernel_(kernel),
         compiled_structs_(compiled_structs),
         needs_root_buffer_(compiled_structs_->root_size > 0),
-        ctx_attribs_(*kernel_) {
+        ctx_attribs_(*kernel_),
+        print_strtab_(print_strtab),
+        cgen_config_(config),
+        offloaded_(offloaded) {
+    ti_kernel_attribus_.name = taichi_kernel_name;
+    ti_kernel_attribus_.is_jit_evaluator = kernel->is_evaluator;
     // allow_undefined_visitor = true;
     for (const auto s : kAllSections) {
       section_appenders_[s] = LineAppender();
@@ -95,8 +118,8 @@ class KernelCodegen : public IRVisitor {
     return ctx_attribs_;
   }
 
-  const std::vector<KernelAttributes> &kernels_attribs() const {
-    return mtl_kernels_attribs_;
+  const TaichiKernelAttributes &ti_kernels_attribs() const {
+    return ti_kernel_attribus_;
   }
 
   std::string run() {
@@ -167,13 +190,17 @@ class KernelCodegen : public IRVisitor {
   }
 
   void visit(GetChStmt *stmt) override {
+    // E.g. `parent.get*(runtime, mem_alloc)`
+    const auto get_call =
+        fmt::format("{}.get{}({}, {})", stmt->input_ptr->raw_name(), stmt->chid,
+                    kRuntimeVarName, kMemAllocVarName);
     if (stmt->output_snode->is_place()) {
-      emit(R"(device {}* {} = {}.get{}().val;)",
+      emit(R"(device {}* {} = {}.val;)",
            metal_data_type_name(stmt->output_snode->dt), stmt->raw_name(),
-           stmt->input_ptr->raw_name(), stmt->chid);
+           get_call);
     } else {
-      emit(R"({} {} = {}.get{}();)", stmt->output_snode->node_type_name,
-           stmt->raw_name(), stmt->input_ptr->raw_name(), stmt->chid);
+      emit(R"({} {} = {};)", stmt->output_snode->node_type_name,
+           stmt->raw_name(), get_call);
     }
   }
 
@@ -186,10 +213,10 @@ class KernelCodegen : public IRVisitor {
     emit(R"(auto {} = {};)", stmt->raw_name(), val);
   }
 
-  void visit(OffsetAndExtractBitsStmt *stmt) override {
-    emit(R"(auto {} = ((({} + {}) >> {}) & ((1 << {}) - 1));)",
-         stmt->raw_name(), stmt->offset, stmt->input->raw_name(),
-         stmt->bit_begin, stmt->bit_end - stmt->bit_begin);
+  void visit(BitExtractStmt *stmt) override {
+    emit(R"(auto {} = (({} >> {}) & ((1 << {}) - 1));)", stmt->raw_name(),
+         stmt->input->raw_name(), stmt->bit_begin,
+         stmt->bit_end - stmt->bit_begin);
   }
 
   void visit(SNodeLookupStmt *stmt) override {
@@ -201,21 +228,15 @@ class KernelCodegen : public IRVisitor {
       parent = root_stmt_->raw_name();
     }
     const auto *sn = stmt->snode;
+    const auto snty = sn->type;
     const std::string index_name = stmt->input_index->raw_name();
+
+    if (stmt->activate) {
+      TI_ASSERT(is_supported_sparse_type(snty));
+      emit("{}.activate({});", parent, index_name);
+    }
     emit(R"({}_ch {} = {}.children({});)", sn->node_type_name, stmt->raw_name(),
          parent, index_name);
-    if (stmt->activate) {
-      TI_ASSERT(is_supported_sparse_type(sn->type));
-      emit("{{");
-      {
-        ScopedIndent s(current_appender());
-        current_appender().append_raw(
-            make_sparse_snode_meta(sn, kSNodeMetaVarName));
-        emit("activate({}.addr(), {}, {});", stmt->raw_name(),
-             kSNodeMetaVarName, index_name);
-      }
-      emit("}}");
-    }
   }
 
   void visit(SNodeOpStmt *stmt) override {
@@ -228,30 +249,39 @@ class KernelCodegen : public IRVisitor {
     emit("{{");
     {
       ScopedIndent s(current_appender());
-      current_appender().append_raw(
-          make_sparse_snode_meta(stmt->snode, kSNodeMetaVarName));
+      const auto &parent = stmt->ptr->raw_name();
       const bool is_dynamic = (stmt->snode->type == SNodeType::dynamic);
-      // Dynamic is a special case because |stmt| doesn't contain an index to
-      // its cells.
-      const std::string ch_id = (is_dynamic ? "0" : stmt->val->raw_name());
+      std::string ch_id;
+      if (is_dynamic &&
+          (opty == SNodeOpType::deactivate || opty == SNodeOpType::append ||
+           opty == SNodeOpType::length)) {
+        // For these ops, `dynamic` is a special case because |stmt| doesn't
+        // contain an index to its cells. Setting it to zero to store the
+        // address of the first child into |ch_addr|.
+        ch_id = "0";
+      } else {
+        ch_id = stmt->val->raw_name();
+      }
       const std::string ch_addr =
           fmt::format("{}.children({}).addr()", stmt->ptr->raw_name(), ch_id);
       if (opty == SNodeOpType::is_active) {
-        // is_active(device byte *addr, SNodeMeta meta, int i);
-        emit("{} = is_active({}, {}, {});", result_var, ch_addr,
-             kSNodeMetaVarName, ch_id);
+        emit("{} = {}.is_active({});", result_var, parent,
+             stmt->val->raw_name());
+      } else if (opty == SNodeOpType::activate) {
+        emit("{}.activate({});", parent, stmt->val->raw_name());
       } else if (opty == SNodeOpType::deactivate) {
-        // deactivate(device byte *addr, SNodeMeta meta, int i);
-        emit("deactivate({}, {}, {});", ch_addr, kSNodeMetaVarName, ch_id);
+        if (is_dynamic) {
+          emit("{}.deactivate();", parent);
+        } else {
+          emit("{}.deactivate({});", parent, stmt->val->raw_name());
+        }
       } else if (opty == SNodeOpType::append) {
         TI_ASSERT(is_dynamic);
-        TI_ASSERT(stmt->ret_type.data_type == DataType::i32);
-        emit("{} = dynamic_append({}, {}, {});", result_var, ch_addr,
-             kSNodeMetaVarName, stmt->val->raw_name());
+        TI_ASSERT(stmt->ret_type->is_primitive(PrimitiveTypeID::i32));
+        emit("{} = {}.append({});", result_var, parent, stmt->val->raw_name());
       } else if (opty == SNodeOpType::length) {
         TI_ASSERT(is_dynamic);
-        emit("{} = dynamic_length({}, {});", result_var, ch_addr,
-             kSNodeMetaVarName);
+        emit("{} = {}.length();", result_var, parent);
       } else {
         TI_NOT_IMPLEMENTED
       }
@@ -320,9 +350,17 @@ class KernelCodegen : public IRVisitor {
 
   void visit(GlobalTemporaryStmt *stmt) override {
     TI_ASSERT(stmt->width() == 1);
-    const auto dt = metal_data_type_name(stmt->element_type());
+    const auto dt = metal_data_type_name(stmt->element_type().ptr_removed());
     emit("device {}* {} = reinterpret_cast<device {}*>({} + {});", dt,
          stmt->raw_name(), dt, kGlobalTmpsBufferName, stmt->offset);
+  }
+
+  void visit(ThreadLocalPtrStmt *stmt) override {
+    TI_ASSERT(stmt->width() == 1);
+    emit("thread auto* {} = reinterpret_cast<thread {}*>({} + {});",
+         stmt->raw_name(),
+         metal_data_type_name(stmt->element_type().ptr_removed()),
+         kTlsBufferName, stmt->offset);
   }
 
   void visit(LoopIndexStmt *stmt) override {
@@ -375,7 +413,7 @@ class KernelCodegen : public IRVisitor {
     const auto bin_name = bin->raw_name();
     const auto op_type = bin->op_type;
     if (op_type == BinaryOpType::floordiv) {
-      if (is_integral(bin->ret_type.data_type)) {
+      if (is_integral(bin->ret_type)) {
         emit("const {} {} = ifloordiv({}, {});", dt_name, bin_name, lhs_name,
              rhs_name);
       } else {
@@ -384,7 +422,7 @@ class KernelCodegen : public IRVisitor {
       }
       return;
     }
-    if (op_type == BinaryOpType::pow && is_integral(bin->ret_type.data_type)) {
+    if (op_type == BinaryOpType::pow && is_integral(bin->ret_type)) {
       // TODO(k-ye): Make sure the type is not i64?
       emit("const {} {} = pow_i32({}, {});", dt_name, bin_name, lhs_name,
            rhs_name);
@@ -436,30 +474,47 @@ class KernelCodegen : public IRVisitor {
       TI_NOT_IMPLEMENTED;
     }
 
-    if (dt == DataType::i32) {
+    std::string val_var = stmt->val->raw_name();
+    // TODO(k-ye): This is not a very reliable way to detect if we're in TLS
+    // xlogues...
+    const bool is_tls_reduction =
+        (inside_tls_epilogue_ && (op_type == AtomicOpType::add));
+    const bool use_simd_in_tls_reduction =
+        (is_tls_reduction && cgen_config_.allow_simdgroup);
+    if (use_simd_in_tls_reduction) {
+      val_var += "_simd_val_";
+      emit("const auto {} = simd_sum({});", val_var, stmt->val->raw_name());
+      emit("if ({} == 0) {{", kKernelTidInSimdgroupName);
+      current_appender().push_indent();
+    }
+
+    if (dt->is_primitive(PrimitiveTypeID::i32)) {
       emit(
           "const auto {} = atomic_fetch_{}_explicit((device atomic_int*){}, "
           "{}, "
           "metal::memory_order_relaxed);",
-          stmt->raw_name(), op_name, stmt->dest->raw_name(),
-          stmt->val->raw_name());
-    } else if (dt == DataType::u32) {
+          stmt->raw_name(), op_name, stmt->dest->raw_name(), val_var);
+    } else if (dt->is_primitive(PrimitiveTypeID::u32)) {
       emit(
           "const auto {} = atomic_fetch_{}_explicit((device atomic_uint*){}, "
           "{}, "
           "metal::memory_order_relaxed);",
-          stmt->raw_name(), op_name, stmt->dest->raw_name(),
-          stmt->val->raw_name());
-    } else if (dt == DataType::f32) {
+          stmt->raw_name(), op_name, stmt->dest->raw_name(), val_var);
+    } else if (dt->is_primitive(PrimitiveTypeID::f32)) {
       if (handle_float) {
         emit("const float {} = fatomic_fetch_{}({}, {});", stmt->raw_name(),
-             op_name, stmt->dest->raw_name(), stmt->val->raw_name());
+             op_name, stmt->dest->raw_name(), val_var);
       } else {
         TI_ERROR("Metal does not support atomic {} for floating points",
                  op_name);
       }
     } else {
       TI_ERROR("Metal only supports 32-bit atomic data types");
+    }
+
+    if (use_simd_in_tls_reduction) {
+      current_appender().pop_indent();
+      emit("}}");  // closes `if (kKernelTidInSimdgroupName == 0) {`
     }
   }
 
@@ -508,8 +563,6 @@ class KernelCodegen : public IRVisitor {
       generate_range_for_kernel(stmt);
     } else if (stmt->task_type == Type::struct_for) {
       generate_struct_for_kernel(stmt);
-    } else if (stmt->task_type == Type::clear_list) {
-      add_runtime_list_op_kernel(stmt, "clear_list");
     } else if (stmt->task_type == Type::listgen) {
       add_runtime_list_op_kernel(stmt, "element_listgen");
     } else if (stmt->task_type == Type::gc) {
@@ -520,6 +573,16 @@ class KernelCodegen : public IRVisitor {
       TI_ERROR("Unsupported offload type={} on Metal arch", stmt->task_name());
     }
     is_top_level_ = true;
+  }
+
+  void visit(ClearListStmt *stmt) override {
+    // TODO: Try to move this into shaders/runtime_utils.metal.h
+    const std::string listmgr("listmgr");
+    emit("ListManager {};", listmgr);
+    emit("{}.lm_data = ({}->snode_lists + {});", listmgr, kRuntimeVarName,
+         stmt->snode->id);
+    emit("{}.clear();", listmgr);
+    used_features()->sparse = true;
   }
 
   void visit(WhileControlStmt *stmt) override {
@@ -542,30 +605,171 @@ class KernelCodegen : public IRVisitor {
 
   void visit(RandStmt *stmt) override {
     emit("const auto {} = metal_rand_{}({});", stmt->raw_name(),
-         data_type_short_name(stmt->ret_type.data_type), kRandStateVarName);
+         data_type_short_name(stmt->ret_type), kRandStateVarName);
   }
 
   void visit(PrintStmt *stmt) override {
-    // TODO: Add a flag to control whether ignoring print() stmt is allowed.
-    TI_WARN("Cannot print inside Metal kernel, ignored");
+    used_features()->print = true;
+
+    const auto &contents = stmt->contents;
+    const int num_entries = contents.size();
+    const std::string msgbuf_var_name = stmt->raw_name() + "_msgbuf_";
+    emit("device auto* {} = mtl_print_alloc_buf({}, {});", msgbuf_var_name,
+         kPrintAllocVarName, num_entries);
+    // Check for buffer overflow
+    emit("if ({}) {{", msgbuf_var_name);
+    {
+      ScopedIndent s(current_appender());
+      const std::string msg_var_name = stmt->raw_name() + "_msg_";
+      emit("PrintMsg {}({}, {});", msg_var_name, msgbuf_var_name, num_entries);
+      for (int i = 0; i < num_entries; ++i) {
+        const auto &entry = contents[i];
+        if (std::holds_alternative<Stmt *>(entry)) {
+          auto *arg_stmt = std::get<Stmt *>(entry);
+          const auto dt = arg_stmt->element_type();
+          TI_ASSERT_INFO(dt->is_primitive(PrimitiveTypeID::i32) ||
+                             dt->is_primitive(PrimitiveTypeID::f32),
+                         "print() only supports i32 or f32 scalars for now.");
+          emit("{}.pm_set_{}({}, {});", msg_var_name, data_type_short_name(dt),
+               i, arg_stmt->raw_name());
+        } else {
+          const int str_id = print_strtab_->put(std::get<std::string>(entry));
+          emit("{}.pm_set_str({}, {});", msg_var_name, i, str_id);
+        }
+      }
+    }
+    emit("}}");
+  }
+
+  void visit(AssertStmt *stmt) override {
+    used_features()->assertion = true;
+
+    const auto &args = stmt->args;
+    // +1 because the assertion message template itself takes one slot
+    const auto num_args = args.size() + 1;
+    TI_ASSERT_INFO(num_args <= shaders::kMetalMaxNumAssertArgs,
+                   "[Metal] Too many args in assert()");
+    emit("if (!({})) {{", stmt->cond->raw_name());
+    {
+      ScopedIndent s(current_appender());
+      // Only record the message for the first-time assertion failure.
+      emit("if ({}.mark_first_failure()) {{", kAssertRecorderVarName);
+      {
+        ScopedIndent s2(current_appender());
+        emit("{}.set_num_args({});", kAssertRecorderVarName, num_args);
+        const std::string asst_var_name = stmt->raw_name() + "_msg_";
+        emit("PrintMsg {}({}.msg_buf_addr(), {});", asst_var_name,
+             kAssertRecorderVarName, num_args);
+        const int msg_str_id = print_strtab_->put(stmt->text);
+        emit("{}.pm_set_str(/*i=*/0, {});", asst_var_name, msg_str_id);
+        for (int i = 1; i < num_args; ++i) {
+          auto *arg = args[i - 1];
+          const auto ty = arg->element_type();
+          if (ty->is_primitive(PrimitiveTypeID::i32) ||
+              ty->is_primitive(PrimitiveTypeID::f32)) {
+            emit("{}.pm_set_{}({}, {});", asst_var_name,
+                 data_type_short_name(ty), i, arg->raw_name());
+          } else {
+            TI_ERROR(
+                "[Metal] assert() only supports i32 or f32 scalars for now.");
+          }
+        }
+      }
+      emit("}}");
+      // This has failed, no point executing the rest of the kernel.
+      emit("return;");
+    }
+    emit("}}");
+  }
+
+  void visit(StackAllocaStmt *stmt) override {
+    TI_ASSERT(stmt->width() == 1);
+
+    const auto &var_name = stmt->raw_name();
+    emit("byte {}[{}];", var_name, stmt->size_in_bytes());
+    emit("mtl_ad_stack_init({});", var_name);
+  }
+
+  void visit(StackPopStmt *stmt) override {
+    emit("mtl_ad_stack_pop({});", stmt->stack->raw_name());
+  }
+
+  void visit(StackPushStmt *stmt) override {
+    auto *stack = stmt->stack->as<StackAllocaStmt>();
+    const auto &stack_name = stack->raw_name();
+    const auto elem_size = stack->element_size_in_bytes();
+    emit("mtl_ad_stack_push({}, {});", stack_name, elem_size);
+    const auto primal_name = stmt->raw_name() + "_primal_";
+    emit(
+        "thread auto* {} = reinterpret_cast<thread "
+        "{}*>(mtl_ad_stack_top_primal({}, {}));",
+        primal_name, metal_data_type_name(stmt->element_type()), stack_name,
+        elem_size);
+    emit("*{} = {};", primal_name, stmt->v->raw_name());
+  }
+
+  void visit(StackLoadTopStmt *stmt) override {
+    auto *stack = stmt->stack->as<StackAllocaStmt>();
+    const auto primal_name = stmt->raw_name() + "_primal_";
+    emit(
+        "thread auto* {} = reinterpret_cast<thread "
+        "{}*>(mtl_ad_stack_top_primal({}, {}));",
+        primal_name, metal_data_type_name(stmt->element_type()),
+        stack->raw_name(), stack->element_size_in_bytes());
+    emit("const auto {} = *{};", stmt->raw_name(), primal_name);
+  }
+
+  void visit(StackLoadTopAdjStmt *stmt) override {
+    auto *stack = stmt->stack->as<StackAllocaStmt>();
+    const auto adjoint_name = stmt->raw_name() + "_adjoint_";
+    emit(
+        "thread auto* {} = reinterpret_cast<thread "
+        "{}*>(mtl_ad_stack_top_adjoint({}, {}));",
+        adjoint_name, metal_data_type_name(stmt->element_type()),
+        stack->raw_name(), stack->element_size_in_bytes());
+    emit("const auto {} = *{};", stmt->raw_name(), adjoint_name);
+  }
+
+  void visit(StackAccAdjointStmt *stmt) override {
+    auto *stack = stmt->stack->as<StackAllocaStmt>();
+    const auto adjoint_name = stmt->raw_name() + "_adjoint_";
+    emit(
+        "thread auto* {} = reinterpret_cast<thread "
+        "{}*>(mtl_ad_stack_top_adjoint({}, {}));",
+        adjoint_name, metal_data_type_name(stmt->element_type()),
+        stack->raw_name(), stack->element_size_in_bytes());
+    emit("*{} += {};", adjoint_name, stmt->v->raw_name());
+  }
+
+  void visit(ExternalTensorShapeAlongAxisStmt *stmt) override {
+    const auto name = stmt->raw_name();
+    const auto arg_id = stmt->arg_id;
+    const auto axis = stmt->axis;
+    emit("const int {} = {}.extra_arg({}, {});", name, kContextVarName, arg_id,
+         axis);
   }
 
  private:
   void emit_headers() {
     SectionGuard sg(this, Section::Headers);
     emit("#include <metal_stdlib>");
+    emit("#include <metal_compute>");
     emit("using namespace metal;");
   }
 
   void generate_structs() {
     SectionGuard sg(this, Section::Structs);
-    emit("using byte = uchar;");
+    emit("using byte = char;");
     emit("");
     current_appender().append_raw(shaders::kMetalHelpersSourceCode);
     emit("");
     current_appender().append_raw(compiled_structs_->runtime_utils_source_code);
     emit("");
     current_appender().append_raw(compiled_structs_->snode_structs_source_code);
+    emit("");
+    current_appender().append_raw(shaders::kMetalAdStackSourceCode);
+    emit("");
+    current_appender().append_raw(shaders::kMetalPrintSourceCode);
     emit("");
     emit_kernel_args_struct();
   }
@@ -616,9 +820,10 @@ class KernelCodegen : public IRVisitor {
 
   void generate_kernels() {
     SectionGuard sg(this, Section::Kernels);
-    kernel_->ir->accept(this);
+    IRNode *ast = offloaded_ ? offloaded_ : kernel_->ir.get();
+    ast->accept(this);
 
-    if (used_features_.runtime_list_ops) {
+    if (used_features()->sparse) {
       emit("");
       current_appender().append_raw(shaders::kMetalRuntimeKernelsSourceCode);
     }
@@ -634,6 +839,8 @@ class KernelCodegen : public IRVisitor {
       result.push_back(BuffersEnum::Context);
     }
     result.push_back(BuffersEnum::Runtime);
+    // TODO(k-ye): Bind this buffer only when print() is used.
+    result.push_back(BuffersEnum::Print);
     return result;
   }
 
@@ -644,7 +851,8 @@ class KernelCodegen : public IRVisitor {
     ka.name = mtl_kernel_name;
     ka.task_type = stmt->task_type;
     ka.buffers = get_common_buffers();
-    ka.num_threads = 1;
+    ka.advisory_total_num_threads = 1;
+    ka.advisory_num_threads_per_group = 1;
 
     emit_mtl_kernel_sig(mtl_kernel_name, ka.buffers);
     {
@@ -662,7 +870,7 @@ class KernelCodegen : public IRVisitor {
     emit("}}\n");
     current_kernel_attribs_ = nullptr;
 
-    mtl_kernels_attribs_.push_back(ka);
+    mtl_kernels_attribs()->push_back(ka);
   }
 
   void generate_range_for_kernel(OffloadedStmt *stmt) {
@@ -673,9 +881,16 @@ class KernelCodegen : public IRVisitor {
     ka.task_type = stmt->task_type;
     ka.buffers = get_common_buffers();
 
-    emit_mtl_kernel_sig(mtl_kernel_name, ka.buffers);
+    const bool used_tls = (stmt->tls_prologue != nullptr);
+    KernelSigExtensions kernel_exts;
+    kernel_exts.use_simdgroup = (used_tls && cgen_config_.allow_simdgroup);
+    used_features()->simdgroup =
+        used_features()->simdgroup || kernel_exts.use_simdgroup;
 
-    auto &range_for_attribs = ka.range_for_attribs;
+    emit_mtl_kernel_sig(mtl_kernel_name, ka.buffers, kernel_exts);
+
+    ka.range_for_attribs = KernelAttributes::RangeForAttributes();
+    auto &range_for_attribs = ka.range_for_attribs.value();
     range_for_attribs.const_begin = stmt->const_begin;
     range_for_attribs.const_end = stmt->const_end;
     range_for_attribs.begin =
@@ -698,7 +913,7 @@ class KernelCodegen : public IRVisitor {
       // sdf_renderer.py benchmark for setting |num_threads|
       // - num_elemnts: ~20 samples/s
       // - kMaxNumThreadsGridStrideLoop: ~12 samples/s
-      ka.num_threads = num_elems;
+      ka.advisory_total_num_threads = num_elems;
     } else {
       emit("// range_for, range known at runtime");
       begin_expr = stmt->const_begin
@@ -708,29 +923,48 @@ class KernelCodegen : public IRVisitor {
                                 ? std::to_string(stmt->end_value)
                                 : inject_load_global_tmp(stmt->end_offset);
       emit("const int {} = {} - {};", total_elems_name, end_expr, begin_expr);
-      ka.num_threads = kMaxNumThreadsGridStrideLoop;
+      ka.advisory_total_num_threads = kMaxNumThreadsGridStrideLoop;
     }
+    ka.advisory_num_threads_per_group = stmt->block_dim;
     // begin_ = thread_id   + begin_expr
     emit("const int begin_ = {} + {};", kKernelThreadIdName, begin_expr);
     // end_   = total_elems + begin_expr
     emit("const int end_ = {} + {};", total_elems_name, begin_expr);
+
+    emit_runtime_and_memalloc_def();
+    if (used_tls) {
+      generate_tls_prologue(stmt);
+    }
+
     emit("for (int ii = begin_; ii < end_; ii += {}) {{", kKernelGridSizeName);
     {
       ScopedIndent s2(current_appender());
 
       current_kernel_attribs_ = &ka;
       const auto mtl_func_name = mtl_kernel_func_name(mtl_kernel_name);
-      emit_mtl_kernel_func_def(mtl_func_name, ka.buffers, stmt->body.get());
-      emit_call_mtl_kernel_func(mtl_func_name, ka.buffers,
+      std::vector<FuncParamLiteral> extra_func_params;
+      std::vector<std::string> extra_args;
+      if (used_tls) {
+        extra_func_params.push_back({"thread char*", kTlsBufferName});
+        extra_args.push_back(kTlsBufferName);
+      }
+      emit_mtl_kernel_func_def(mtl_func_name, ka.buffers, extra_func_params,
+                               stmt->body.get());
+      emit_call_mtl_kernel_func(mtl_func_name, ka.buffers, extra_args,
                                 /*loop_index_expr=*/"ii");
     }
     emit("}}");  // closes for loop
+
+    if (used_tls) {
+      generate_tls_epilogue(stmt);
+    }
+
     current_appender().pop_indent();
     // Close kernel
     emit("}}\n");
     current_kernel_attribs_ = nullptr;
 
-    mtl_kernels_attribs_.push_back(ka);
+    mtl_kernels_attribs()->push_back(ka);
   }
 
   void generate_struct_for_kernel(OffloadedStmt *stmt) {
@@ -742,26 +976,34 @@ class KernelCodegen : public IRVisitor {
     ka.task_type = stmt->task_type;
     ka.buffers = get_common_buffers();
 
-    emit_mtl_kernel_sig(mtl_kernel_name, ka.buffers);
+    const bool used_tls = (stmt->tls_prologue != nullptr);
+    KernelSigExtensions kernel_exts;
+    kernel_exts.use_simdgroup = (used_tls && cgen_config_.allow_simdgroup);
+    used_features()->simdgroup =
+        used_features()->simdgroup || kernel_exts.use_simdgroup;
+    emit_mtl_kernel_sig(mtl_kernel_name, ka.buffers, kernel_exts);
 
     const int sn_id = stmt->snode->id;
     // struct_for kernels use grid-stride loops
     const int total_num_elems_from_root =
         compiled_structs_->snode_descriptors.find(sn_id)
             ->second.total_num_elems_from_root;
-    ka.num_threads =
+    ka.advisory_total_num_threads =
         std::min(total_num_elems_from_root, kMaxNumThreadsGridStrideLoop);
+    ka.advisory_num_threads_per_group = stmt->block_dim;
 
     current_appender().push_indent();
     emit("// struct_for");
-    emit("device Runtime *{} = reinterpret_cast<device Runtime *>({});",
-         kRuntimeVarName, kRuntimeBufferName);
-    emit(
-        "device byte *list_data_addr = reinterpret_cast<device byte *>({} + "
-        "1);",
-        kRuntimeVarName);
-    emit("device ListManager *parent_list = &({}->snode_lists[{}]);",
-         kRuntimeVarName, sn_id);
+    emit_runtime_and_memalloc_def();
+
+    if (used_tls) {
+      generate_tls_prologue(stmt);
+    }
+
+    emit("ListManager parent_list;");
+    emit("parent_list.lm_data = ({}->snode_lists + {});", kRuntimeVarName,
+         sn_id);
+    emit("parent_list.mem_alloc = {};", kMemAllocVarName);
     emit("const SNodeMeta parent_meta = {}->snode_metas[{}];", kRuntimeVarName,
          sn_id);
     emit("const int child_stride = parent_meta.element_stride;");
@@ -773,12 +1015,14 @@ class KernelCodegen : public IRVisitor {
     {
       ScopedIndent s2(current_appender());
       emit("const int parent_idx_ = (ii / child_num_slots);");
-      emit("if (parent_idx_ >= num_active(parent_list)) return;");
+      emit("if (parent_idx_ >= parent_list.num_active()) return;");
       emit("const int child_idx_ = (ii % child_num_slots);");
       emit(
-          "const auto parent_elem_ = get<ListgenElement>(parent_list, "
-          "parent_idx_, list_data_addr);");
-
+          "const auto parent_elem_ = "
+          "parent_list.get<ListgenElement>(parent_idx_);");
+      emit("device auto *parent_addr_ = {} + parent_elem_.root_mem_offset;",
+           kRootBufferName);
+      emit("if (!is_active(parent_addr_, parent_meta, child_idx_)) continue;");
       emit("ListgenElement {};", kListgenElemVarName);
       // No need to add mem_offset_in_parent, because place() always starts at 0
       emit(
@@ -786,32 +1030,57 @@ class KernelCodegen : public IRVisitor {
           "child_stride;",
           kListgenElemVarName);
       emit(
-          "if (!is_active({} + {}.root_mem_offset, parent_meta, child_idx_)) "
-          "continue;",
-          kRootBufferName, kListgenElemVarName);
-      emit(
           "refine_coordinates(parent_elem_, {}->snode_extractors[{}], "
           "child_idx_, &{});",
           kRuntimeVarName, sn_id, kListgenElemVarName);
 
       current_kernel_attribs_ = &ka;
       const auto mtl_func_name = mtl_kernel_func_name(mtl_kernel_name);
-      emit_mtl_kernel_func_def(
-          mtl_func_name, ka.buffers,
-          /*extra_params=*/
-          {{"thread const ListgenElement&", kListgenElemVarName}},
-          stmt->body.get());
-      emit_call_mtl_kernel_func(mtl_func_name, ka.buffers,
-                                /*extra_args=*/
-                                {kListgenElemVarName},
+      std::vector<FuncParamLiteral> extra_func_params = {
+          {"thread const ListgenElement&", kListgenElemVarName},
+      };
+      std::vector<std::string> extra_args = {
+          kListgenElemVarName,
+      };
+      if (used_tls) {
+        extra_func_params.push_back({"thread char*", kTlsBufferName});
+        extra_args.push_back(kTlsBufferName);
+      }
+      emit_mtl_kernel_func_def(mtl_func_name, ka.buffers, extra_func_params,
+                               stmt->body.get());
+      emit_call_mtl_kernel_func(mtl_func_name, ka.buffers, extra_args,
                                 /*loop_index_expr=*/"ii");
       current_kernel_attribs_ = nullptr;
     }
     emit("}}");  // closes for loop
     current_appender().pop_indent();
+
+    if (used_tls) {
+      generate_tls_epilogue(stmt);
+    }
     emit("}}\n");  // closes kernel
 
-    mtl_kernels_attribs_.push_back(ka);
+    mtl_kernels_attribs()->push_back(ka);
+  }
+
+  void generate_tls_prologue(OffloadedStmt *stmt) {
+    TI_ASSERT(stmt->tls_prologue != nullptr);
+    emit("// TLS prologue");
+    const std::string tls_bufi32_name = "tls_bufi32_";
+    // Using |int32_t| because it aligns to 4bytes.
+    emit("int32_t {}[{}];", tls_bufi32_name, (stmt->tls_size + 3) / 4);
+    emit("thread char* {} = reinterpret_cast<thread char*>({});",
+         kTlsBufferName, tls_bufi32_name);
+    stmt->tls_prologue->accept(this);
+  }
+
+  void generate_tls_epilogue(OffloadedStmt *stmt) {
+    TI_ASSERT(stmt->tls_epilogue != nullptr);
+    inside_tls_epilogue_ = true;
+    emit("{{  // TLS epilogue");
+    stmt->tls_epilogue->accept(this);
+    inside_tls_epilogue_ = false;
+    emit("}}");
   }
 
   void add_runtime_list_op_kernel(OffloadedStmt *stmt,
@@ -822,29 +1091,30 @@ class KernelCodegen : public IRVisitor {
     KernelAttributes ka;
     ka.name = kernel_name;
     ka.task_type = stmt->task_type;
-    if (type == Type::clear_list) {
-      ka.num_threads = 1;
-      ka.buffers = {BuffersEnum::Runtime, BuffersEnum::Context};
-    } else if (type == Type::listgen) {
+    if (type == Type::listgen) {
       // listgen kernels use grid-stride loops
       const auto &sn_descs = compiled_structs_->snode_descriptors;
-      ka.num_threads = std::min(
+      ka.advisory_total_num_threads = std::min(
           sn_descs.find(sn->id)->second.total_num_self_from_root(sn_descs),
           kMaxNumThreadsGridStrideLoop);
+      ka.advisory_num_threads_per_group = stmt->block_dim;
       ka.buffers = {BuffersEnum::Runtime, BuffersEnum::Root,
                     BuffersEnum::Context};
     } else {
       TI_ERROR("Unsupported offload task type {}", stmt->task_name());
     }
-    ka.runtime_list_op_attribs.snode = sn;
+
+    ka.runtime_list_op_attribs = KernelAttributes::RuntimeListOpAttributes();
+    ka.runtime_list_op_attribs->snode = sn;
     current_kernel_attribs_ = nullptr;
 
-    mtl_kernels_attribs_.push_back(ka);
-    used_features_.runtime_list_ops = true;
+    mtl_kernels_attribs()->push_back(ka);
+    used_features()->sparse = true;
   }
 
-  std::string inject_load_global_tmp(int offset, DataType dt = DataType::i32) {
-    const auto vt = VectorType(/*width=*/1, dt);
+  std::string inject_load_global_tmp(int offset,
+                                     DataType dt = PrimitiveType::i32) {
+    const auto vt = TypeFactory::create_vector_or_scalar_type(1, dt);
     auto gtmp = Stmt::make<GlobalTemporaryStmt>(offset, vt);
     gtmp->accept(this);
     auto gload = Stmt::make<GlobalLoadStmt>(gtmp.get());
@@ -876,8 +1146,7 @@ class KernelCodegen : public IRVisitor {
 
     {
       ScopedIndent s(current_appender());
-      emit("device Runtime *{} = reinterpret_cast<device Runtime *>({});",
-           kRuntimeVarName, kRuntimeBufferName);
+      emit_runtime_and_memalloc_def();
       if (!ctx_attribs_.empty()) {
         emit("{} {}({});", kernel_args_classname(), kContextVarName,
              kContextBufferName);
@@ -890,6 +1159,17 @@ class KernelCodegen : public IRVisitor {
           fmt::arg("rtm", kRuntimeVarName),
           fmt::arg("lidx", kLinearLoopIndexName),
           fmt::arg("nums", kNumRandSeeds));
+      // Init AssertRecorder.
+      emit("AssertRecorder {}({});", kAssertRecorderVarName,
+           kPrintAssertBufferName);
+      // Init PrintMsgAllocator.
+      // The print buffer comes after (AssertRecorder + assert message buffer),
+      // therefore we skip by +|kMetalAssertBufferSize|.
+      emit(
+          "device auto* {} = reinterpret_cast<device PrintMsgAllocator*>({} + "
+          "{});",
+          kPrintAllocVarName, kPrintAssertBufferName,
+          shaders::kMetalAssertBufferSize);
     }
     // We do not need additional indentation, because |func_ir| itself is a
     // block, which will be indented automatically.
@@ -931,38 +1211,38 @@ class KernelCodegen : public IRVisitor {
                               loop_index_expr);
   }
 
+  struct KernelSigExtensions {
+    // https://stackoverflow.com/a/44693603/12003165
+    KernelSigExtensions() noexcept {
+    }
+
+    bool use_simdgroup = false;
+  };
+
   void emit_mtl_kernel_sig(
       const std::string &kernel_name,
-      const std::vector<KernelAttributes::Buffers> &buffers) {
+      const std::vector<KernelAttributes::Buffers> &buffers,
+      const KernelSigExtensions &exts = {}) {
     emit("kernel void {}(", kernel_name);
     for (int i = 0; i < buffers.size(); ++i) {
       emit("    device byte* {} [[buffer({})]],", buffer_to_name(buffers[i]),
            i);
     }
     emit("    const uint {} [[threads_per_grid]],", kKernelGridSizeName);
+    if (exts.use_simdgroup) {
+      emit("    const uint {} [[thread_index_in_simdgroup]],",
+           kKernelTidInSimdgroupName);
+    }
     emit("    const uint {} [[thread_position_in_grid]]) {{",
          kKernelThreadIdName);
   }
 
-  std::string make_sparse_snode_meta(const SNode *sn,
-                                     const std::string &var_name) const {
-    const auto &desc =
-        compiled_structs_->snode_descriptors.find(sn->id)->second;
-    LineAppender la = current_appender();
-    // Keep the indentation settings only
-    la.clear_lines();
-
-    la.append("SNodeMeta {};", var_name);
-    la.append("{}.element_stride = {};", var_name, desc.element_stride);
-    la.append("{}.num_slots = {};", var_name, desc.num_slots);
-    if (sn->type == SNodeType::bitmasked) {
-      la.append("{}.type = {};", var_name, (int)shaders::SNodeMeta::Bitmasked);
-    } else if (sn->type == SNodeType::dynamic) {
-      la.append("{}.type = {};", var_name, (int)shaders::SNodeMeta::Dynamic);
-    } else {
-      TI_NOT_IMPLEMENTED;
-    }
-    return la.lines();
+  void emit_runtime_and_memalloc_def() {
+    emit("device auto *{} = reinterpret_cast<device Runtime *>({});",
+         kRuntimeVarName, kRuntimeBufferName);
+    emit(
+        "device auto *{} = reinterpret_cast<device MemoryAllocator *>({} + 1);",
+        kMemAllocVarName, kRuntimeVarName);
   }
 
   std::string make_kernel_name() {
@@ -1008,51 +1288,57 @@ class KernelCodegen : public IRVisitor {
     current_appender().append(std::move(f), std::forward<Args>(args)...);
   }
 
+  std::vector<KernelAttributes> *mtl_kernels_attribs() {
+    return &(ti_kernel_attribus_.mtl_kernels_attribs);
+  }
+
+  TaichiKernelAttributes::UsedFeatures *used_features() {
+    return &(ti_kernel_attribus_.used_features);
+  }
+
   const std::string mtl_kernel_prefix_;
   const std::string root_snode_type_name_;
   Kernel *const kernel_;
   const CompiledStructs *const compiled_structs_;
   const bool needs_root_buffer_;
   const KernelContextAttributes ctx_attribs_;
+  PrintStringTable *const print_strtab_;
+  const Config &cgen_config_;
+  OffloadedStmt *const offloaded_;
 
   bool is_top_level_{true};
   int mtl_kernel_count_{0};
-  std::vector<KernelAttributes> mtl_kernels_attribs_;
-  UsedFeatures used_features_;
+  TaichiKernelAttributes ti_kernel_attribus_;
   GetRootStmt *root_stmt_{nullptr};
   KernelAttributes *current_kernel_attribs_{nullptr};
+  bool inside_tls_epilogue_{false};
   Section code_section_{Section::Structs};
   std::unordered_map<Section, LineAppender> section_appenders_;
 };
 
 }  // namespace
 
-CodeGen::CodeGen(Kernel *kernel,
-                 KernelManager *kernel_mgr,
-                 const CompiledStructs *compiled_structs)
-    : kernel_(kernel),
-      kernel_mgr_(kernel_mgr),
-      compiled_structs_(compiled_structs),
-      id_(Program::get_kernel_id()),
-      taichi_kernel_name_(fmt::format("mtl_k{:04d}_{}", id_, kernel_->name)) {
-}
+FunctionType compile_to_metal_executable(
+    Kernel *kernel,
+    KernelManager *kernel_mgr,
+    const CompiledStructs *compiled_structs,
+    OffloadedStmt *offloaded) {
+  const auto id = Program::get_kernel_id();
+  const auto taichi_kernel_name(
+      fmt::format("mtl_k{:04d}_{}", id, kernel->name));
 
-FunctionType CodeGen::compile() {
-  auto &config = kernel_->program.config;
-  config.demote_dense_struct_fors = true;
-  irpass::compile_to_offloads(kernel_->ir.get(), config,
-                              /*vectorize=*/false, kernel_->grad,
-                              /*ad_use_stack=*/false, config.print_ir);
+  KernelCodegen::Config cgen_config;
+  cgen_config.allow_simdgroup = EnvConfig::instance().is_simdgroup_enabled();
 
-  KernelCodegen codegen(taichi_kernel_name_,
-                        kernel_->program.snode_root->node_type_name, kernel_,
-                        compiled_structs_);
+  KernelCodegen codegen(
+      taichi_kernel_name, kernel->program.snode_root->node_type_name, kernel,
+      compiled_structs, kernel_mgr->print_strtable(), cgen_config, offloaded);
+
   const auto source_code = codegen.run();
-  kernel_mgr_->register_taichi_kernel(taichi_kernel_name_, source_code,
-                                      codegen.kernels_attribs(),
-                                      codegen.kernel_ctx_attribs());
-  return [kernel_mgr = kernel_mgr_,
-          kernel_name = taichi_kernel_name_](Context &ctx) {
+  kernel_mgr->register_taichi_kernel(taichi_kernel_name, source_code,
+                                     codegen.ti_kernels_attribs(),
+                                     codegen.kernel_ctx_attribs());
+  return [kernel_mgr, kernel_name = taichi_kernel_name](Context &ctx) {
     kernel_mgr->launch_taichi_kernel(kernel_name, &ctx);
   };
 }

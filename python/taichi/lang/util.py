@@ -1,13 +1,17 @@
 from .core import taichi_lang_core
+from taichi.misc.util import warning, deprecated, obsolete, get_traceback
 import numpy as np
+import os
 
 _has_pytorch = False
 
-try:
-    import torch
-    _has_pytorch = True
-except:
-    pass
+_env_torch = os.environ.get('TI_ENABLE_TORCH', '1')
+if not _env_torch or int(_env_torch):
+    try:
+        import torch
+        _has_pytorch = True
+    except:
+        pass
 
 
 def has_pytorch():
@@ -26,35 +30,35 @@ def is_taichi_class(rhs):
 
 # Real types
 
-float32 = taichi_lang_core.DataType.float32
+float32 = taichi_lang_core.DataType_f32
 f32 = float32
-float64 = taichi_lang_core.DataType.float64
+float64 = taichi_lang_core.DataType_f64
 f64 = float64
 
-real_types = [f32, f64]
+real_types = [f32, f64, float]
 real_type_ids = [id(t) for t in real_types]
 
 # Integer types
 
-int8 = taichi_lang_core.DataType.int8
+int8 = taichi_lang_core.DataType_i8
 i8 = int8
-int16 = taichi_lang_core.DataType.int16
+int16 = taichi_lang_core.DataType_i16
 i16 = int16
-int32 = taichi_lang_core.DataType.int32
+int32 = taichi_lang_core.DataType_i32
 i32 = int32
-int64 = taichi_lang_core.DataType.int64
+int64 = taichi_lang_core.DataType_i64
 i64 = int64
 
-uint8 = taichi_lang_core.DataType.uint8
+uint8 = taichi_lang_core.DataType_u8
 u8 = uint8
-uint16 = taichi_lang_core.DataType.uint16
+uint16 = taichi_lang_core.DataType_u16
 u16 = uint16
-uint32 = taichi_lang_core.DataType.uint32
+uint32 = taichi_lang_core.DataType_u32
 u32 = uint32
-uint64 = taichi_lang_core.DataType.uint64
+uint64 = taichi_lang_core.DataType_u64
 u64 = uint64
 
-integer_types = [i8, i16, i32, i64, u8, u16, u32, u64]
+integer_types = [i8, i16, i32, i64, u8, u16, u32, u64, int]
 integer_type_ids = [id(t) for t in integer_types]
 
 types = real_types + integer_types
@@ -162,29 +166,37 @@ def to_taichi_type(dt):
     raise AssertionError("Unknown type {}".format(dt))
 
 
-def deprecated(old, new):
-    import functools
+def cook_dtype(dtype):
+    from .impl import get_runtime
+    _taichi_skip_traceback = 1
+    if isinstance(dtype, taichi_lang_core.DataType):
+        return dtype
+    elif isinstance(dtype, taichi_lang_core.Type):
+        return taichi_lang_core.DataType(dtype)
+    elif dtype is float:
+        return get_runtime().default_fp
+    elif dtype is int:
+        return get_runtime().default_ip
+    else:
+        raise ValueError(f'Invalid data type {dtype}')
 
-    def decorator(foo):
-        @functools.wraps(foo)
-        def wrapped(*args, **kwargs):
-            import warnings
-            msg = f'{old} is deprecated, please use {new} instead'
-            warnings.warn(msg, DeprecationWarning, stacklevel=2)
-            return foo(*args, **kwargs)
 
-        return wrapped
+def in_taichi_scope():
+    from . import impl
+    return impl.inside_kernel()
 
-    return decorator
+
+def in_python_scope():
+    return not in_taichi_scope()
 
 
 def taichi_scope(func):
     import functools
-    from . import impl
 
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
-        assert impl.inside_kernel(), \
+        _taichi_skip_traceback = 1
+        assert in_taichi_scope(), \
                 f'{func.__name__} cannot be called in Python-scope'
         return func(*args, **kwargs)
 
@@ -193,11 +205,11 @@ def taichi_scope(func):
 
 def python_scope(func):
     import functools
-    from . import impl
 
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
-        assert not impl.inside_kernel(), \
+        _taichi_skip_traceback = 1
+        assert in_python_scope(), \
                 f'{func.__name__} cannot be called in Taichi-scope'
         return func(*args, **kwargs)
 

@@ -1,6 +1,7 @@
 #include "taichi/ir/frontend.h"
 #include "taichi/ir/transforms.h"
 #include "taichi/ir/analysis.h"
+#include "taichi/ir/statements.h"
 #include "taichi/util/testing.h"
 
 TLANG_NAMESPACE_BEGIN
@@ -9,11 +10,11 @@ TI_TEST("same_statements") {
   SECTION("test_same_block") {
     auto block = std::make_unique<Block>();
 
-    auto global_load_addr =
-        block->push_back<GlobalTemporaryStmt>(0, VectorType(1, DataType::i32));
+    auto global_load_addr = block->push_back<GlobalTemporaryStmt>(
+        0, TypeFactory::create_vector_or_scalar_type(1, PrimitiveType::i32));
     auto global_load = block->push_back<GlobalLoadStmt>(global_load_addr);
-    auto global_store_addr =
-        block->push_back<GlobalTemporaryStmt>(4, VectorType(1, DataType::i32));
+    auto global_store_addr = block->push_back<GlobalTemporaryStmt>(
+        4, TypeFactory::create_vector_or_scalar_type(1, PrimitiveType::i32));
     auto one = block->push_back<ConstStmt>(TypedConstant(1));
     auto if_stmt = block->push_back<IfStmt>(one)->as<IfStmt>();
 
@@ -23,7 +24,7 @@ TI_TEST("same_statements") {
                                                          global_load, true_one);
     auto true_store =
         true_clause->push_back<GlobalStoreStmt>(global_store_addr, true_add);
-    if_stmt->true_statements = std::move(true_clause);
+    if_stmt->set_true_statements(std::move(true_clause));
 
     auto false_clause = std::make_unique<Block>();
     auto false_one = false_clause->push_back<ConstStmt>(TypedConstant(1));
@@ -31,9 +32,9 @@ TI_TEST("same_statements") {
         BinaryOpType::add, global_load, false_one);
     auto false_store =
         false_clause->push_back<GlobalStoreStmt>(global_store_addr, false_add);
-    if_stmt->false_statements = std::move(false_clause);
+    if_stmt->set_false_statements(std::move(false_clause));
 
-    irpass::typecheck(block.get());
+    irpass::type_check(block.get());
     TI_CHECK(block->size() == 5);
 
     TI_CHECK(irpass::analysis::same_statements(true_one, false_one));
@@ -70,7 +71,7 @@ TI_TEST("same_statements") {
     auto assert_one_a_zero =
         block->push_back<AssertStmt>(one, "a", std::vector<Stmt *>(1, zero));
 
-    irpass::typecheck(block.get());
+    irpass::type_check(block.get());
     TI_CHECK(block->size() == 10);
     TI_CHECK(irpass::analysis::same_statements(assert_zero_a, assert_zero_a2));
     TI_CHECK(!irpass::analysis::same_statements(assert_zero_a, assert_zero_b));
@@ -92,17 +93,17 @@ TI_TEST("same_statements") {
     auto zero = block->push_back<ConstStmt>(LaneAttribute<TypedConstant>(0));
     SNode root(0, SNodeType::root);
     auto &child = root.insert_children(SNodeType::dense);
-    auto lookup1 = block->push_back<SNodeLookupStmt>(
-        &root, get_root, zero, false, std::vector<Stmt *>());
-    auto lookup2 = block->push_back<SNodeLookupStmt>(
-        &root, get_root, zero, false, std::vector<Stmt *>());
-    auto lookup_activate = block->push_back<SNodeLookupStmt>(
-        &root, get_root, zero, true, std::vector<Stmt *>());
+    auto lookup1 =
+        block->push_back<SNodeLookupStmt>(&root, get_root, zero, false);
+    auto lookup2 =
+        block->push_back<SNodeLookupStmt>(&root, get_root, zero, false);
+    auto lookup_activate =
+        block->push_back<SNodeLookupStmt>(&root, get_root, zero, true);
     auto get_child = block->push_back<GetChStmt>(lookup_activate, 0);
-    auto lookup_child = block->push_back<SNodeLookupStmt>(
-        &child, get_child, zero, false, std::vector<Stmt *>());
+    auto lookup_child =
+        block->push_back<SNodeLookupStmt>(&child, get_child, zero, false);
 
-    irpass::typecheck(block.get());
+    irpass::type_check(block.get());
     TI_CHECK(block->size() == 7);
     TI_CHECK(irpass::analysis::same_statements(lookup1, lookup2));
     TI_CHECK(!irpass::analysis::same_statements(lookup1, lookup_activate));

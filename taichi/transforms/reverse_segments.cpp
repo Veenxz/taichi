@@ -26,6 +26,7 @@ class GatherStmts : public BasicStmtVisitor {
 };
 
 void reverse_segments(IRNode *root) {
+  TI_AUTO_PROF;
   auto block = dynamic_cast<Block *>(root);
   std::vector<std::vector<pStmt>> statement_blocks(1);
   bool has_for = false;
@@ -65,7 +66,9 @@ void reverse_segments(IRNode *root) {
   if (has_for && has_non_for)
     TI_ERROR(
         "Invalid program input for autodiff. Please check the documentation "
-        "for the \"Kernel Simplicity Rule\".");
+        "for the \"Kernel Simplicity Rule\":\n"
+        "https://taichi.readthedocs.io/en/stable/"
+        "differentiable_programming.html#simplicity_rule");
   for (auto &sblock : statement_blocks) {
     for (auto &&s : sblock) {
       block->statements.push_back(std::move(s));

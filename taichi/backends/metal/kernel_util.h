@@ -1,9 +1,10 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
-#include "taichi/ir/statements.h"
+#include "taichi/ir/offloaded_task_type.h"
 #include "taichi/backends/metal/data_types.h"
 
 // Data structures defined in this file may overlap with some of the Taichi data
@@ -21,6 +22,16 @@ class SNode;
 
 namespace metal {
 
+// TODO(k-ye): Share this between OpenGL and Metal?
+class PrintStringTable {
+ public:
+  int put(const std::string &str);
+  const std::string &get(int i);
+
+ private:
+  std::vector<std::string> strs_;
+};
+
 // This struct holds the necessary information to launch a Metal kernel.
 struct KernelAttributes {
   enum class Buffers {
@@ -28,10 +39,17 @@ struct KernelAttributes {
     GlobalTmps,
     Context,
     Runtime,
+    Print,
   };
   std::string name;
-  int num_threads;
-  OffloadedStmt::TaskType task_type;
+  // Total number of threads to launch (i.e. threads per grid). Note that this
+  // is only advisory, because eventually this numb er is also determined by the
+  // runtime config. This works because grid strided loop is supported.
+  int advisory_total_num_threads;
+  // Block size in CUDA's terminology. On Metal, it is called a threadgroup.
+  int advisory_num_threads_per_group;
+
+  OffloadedTaskType task_type;
 
   struct RangeForAttributes {
     // |begin| has differen meanings depending on |const_begin|:
@@ -54,13 +72,33 @@ struct KernelAttributes {
   };
   std::vector<Buffers> buffers;
   // Only valid when |task_type| is range_for.
-  // TODO(k-ye): Use std::optional to wrap |task_type| dependent attributes.
-  RangeForAttributes range_for_attribs;
-  // clear_list + listgen
-  RuntimeListOpAttributes runtime_list_op_attribs;
+  std::optional<RangeForAttributes> range_for_attribs;
+  // Only valid when |task_type| is {clear_list, listgen}.
+  std::optional<RuntimeListOpAttributes> runtime_list_op_attribs;
 
   static std::string buffers_name(Buffers b);
   std::string debug_string() const;
+};
+
+// Groups all the Metal kernels generated from a single ti.kernel
+struct TaichiKernelAttributes {
+  struct UsedFeatures {
+    // Whether print() is called inside this kernel.
+    bool print = false;
+    // Whether assert is called inside this kernel.
+    bool assertion = false;
+    // Whether this kernel accesses (read or write) sparse SNodes.
+    bool sparse = false;
+    // Whether [[thread_index_in_simdgroup]] is used. This is only supported
+    // since MSL 2.1
+    bool simdgroup = false;
+  };
+  std::string name;
+  // Is this kernel for evaluating the constant fold result?
+  bool is_jit_evaluator = false;
+  // Attributes of all the Metal kernels produced from this Taichi kernel.
+  std::vector<KernelAttributes> mtl_kernels_attribs;
+  UsedFeatures used_features;
 };
 
 // This class contains the attributes descriptors for both the input args and

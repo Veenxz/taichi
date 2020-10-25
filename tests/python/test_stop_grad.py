@@ -3,8 +3,8 @@ import taichi as ti
 
 @ti.all_archs
 def test_normal_grad():
-    x = ti.var(ti.f32)
-    loss = ti.var(ti.f32)
+    x = ti.field(ti.f32)
+    loss = ti.field(ti.f32)
 
     n = 128
 
@@ -15,7 +15,7 @@ def test_normal_grad():
     @ti.kernel
     def func():
         for i in range(n):
-            ti.atomic_add(loss, x[i]**2)
+            loss[None] += x[i]**2
 
     for i in range(n):
         x[i] = i
@@ -29,8 +29,8 @@ def test_normal_grad():
 
 @ti.all_archs
 def test_stop_grad():
-    x = ti.var(ti.f32)
-    loss = ti.var(ti.f32)
+    x = ti.field(ti.f32)
+    loss = ti.field(ti.f32)
 
     n = 128
 
@@ -41,8 +41,8 @@ def test_stop_grad():
     @ti.kernel
     def func():
         for i in range(n):
-            ti.core.stop_grad(x.snode().ptr)
-            ti.atomic_add(loss, x[i]**2)
+            ti.core.stop_grad(x.snode.ptr)
+            loss[None] += x[i]**2
 
     for i in range(n):
         x[i] = i
@@ -56,8 +56,8 @@ def test_stop_grad():
 
 @ti.all_archs
 def test_stop_grad2():
-    x = ti.var(ti.f32)
-    loss = ti.var(ti.f32)
+    x = ti.field(ti.f32)
+    loss = ti.field(ti.f32)
 
     n = 128
 
@@ -70,9 +70,9 @@ def test_stop_grad2():
         # Two loops, one with stop grad on without
         for i in range(n):
             ti.stop_grad(x)
-            ti.atomic_add(loss, x[i]**2)
+            loss[None] += x[i]**2
         for i in range(n):
-            ti.atomic_add(loss, x[i]**2)
+            loss[None] += x[i]**2
 
     for i in range(n):
         x[i] = i

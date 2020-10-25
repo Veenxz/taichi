@@ -7,6 +7,7 @@
 #include "taichi/backends/opengl/opengl_data_types.h"
 #include "taichi/backends/opengl/opengl_kernel_util.h"
 #include "taichi/ir/ir.h"
+#include "taichi/ir/statements.h"
 #include "taichi/ir/transforms.h"
 #include "taichi/util/line_appender.h"
 #include "taichi/util/macros.h"
@@ -14,15 +15,26 @@
 TLANG_NAMESPACE_BEGIN
 namespace opengl {
 
-KernelParallelAttrib::KernelParallelAttrib(OffloadedStmt *stmt)
-    : KernelParallelAttrib(-1) {
+ParallelSize_DynamicRange::ParallelSize_DynamicRange(OffloadedStmt *stmt) {
   const_begin = stmt->const_begin;
   const_end = stmt->const_end;
   range_begin = stmt->const_begin ? stmt->begin_value : stmt->begin_offset;
   range_end = stmt->const_end ? stmt->end_value : stmt->end_offset;
 }
 
+ParallelSize_StructFor::ParallelSize_StructFor(OffloadedStmt *stmt) {
+}
+
 namespace {
+
+int find_children_id(const SNode *snode) {
+  auto parent = snode->parent;
+  for (int i = 0; i < parent->ch.size(); i++) {
+    if (parent->ch[i].get() == snode)
+      return i;
+  }
+  TI_ERROR("Child not found in parent!");
+}
 
 std::string opengl_atomic_op_type_cap_name(AtomicOpType type) {
   static std::map<AtomicOpType, std::string> type_names;
@@ -50,31 +62,37 @@ class KernelGen : public IRVisitor {
             std::string kernel_name,
             StructCompiledResult *struct_compiled)
       : kernel(kernel),
-        compiled_program_(std::make_unique<CompiledProgram>(kernel)),
         struct_compiled_(struct_compiled),
         kernel_name_(kernel_name),
-        glsl_kernel_prefix_(kernel_name) {
+        glsl_kernel_prefix_(kernel_name),
+        compiled_program_(std::make_unique<CompiledProgram>(kernel)),
+        ps(std::make_unique<ParallelSize_ConstRange>(0)) {
     allow_undefined_visitor = true;
     invoke_default_visitor = true;
   }
 
- private:  // {{{
-  std::unique_ptr<CompiledProgram> compiled_program_;
-
+ private:
+  // constants:
   StructCompiledResult *struct_compiled_;
   const SNode *root_snode_;
   GetRootStmt *root_stmt_;
   std::string kernel_name_;
-  std::string glsl_kernel_name_;
   std::string root_snode_type_name_;
   std::string glsl_kernel_prefix_;
-  int glsl_kernel_count_{0};
 
+  // throughout variables:
+  int glsl_kernel_count_{0};
   bool is_top_level_{true};
+  std::unique_ptr<CompiledProgram> compiled_program_;
+  UsedFeature used;  // TODO: is this actually per-offload?
+
+  // per-offload variables:
   LineAppender line_appender_;
   LineAppender line_appender_header_;
-  KernelParallelAttrib kpa;
-  UsedFeature used;
+  std::string glsl_kernel_name_;
+  std::unique_ptr<ParallelSize> ps;
+  bool is_grid_stride_loop_{false};
+  bool used_tls;  // TODO: move into UsedFeature?
 
   template <typename... Args>
   void emit(std::string f, Args &&... args) {
@@ -85,16 +103,25 @@ class KernelGen : public IRVisitor {
   }
 
   // Note that the following two functions not only returns the corresponding
-  // data type, but also **records** the usage of `i64`.
+  // data type, but also **records** the usage of `i64` and `f64`.
   std::string opengl_data_type_short_name(DataType dt) {
-    if (dt == DataType::i64)
+    if (dt->is_primitive(PrimitiveTypeID::i64)) {
+      if (!TI_OPENGL_REQUIRE(used, GL_ARB_gpu_shader_int64)) {
+        TI_ERROR(
+            "Extension GL_ARB_gpu_shader_int64 not supported on your OpenGL");
+      }
       used.int64 = true;
+    }
+    if (dt->is_primitive(PrimitiveTypeID::f64))
+      used.float64 = true;
     return data_type_short_name(dt);
   }
 
   std::string opengl_data_type_name(DataType dt) {
-    if (dt == DataType::i64)
+    if (dt->is_primitive(PrimitiveTypeID::i64))
       used.int64 = true;
+    if (dt->is_primitive(PrimitiveTypeID::f64))
+      used.float64 = true;
     return opengl::opengl_data_type_name(dt);
   }
 
@@ -110,42 +137,50 @@ class KernelGen : public IRVisitor {
 
     // clang-format off
 #define __GLSL__
-    std::string kernel_header =
-#include "taichi/backends/opengl/runtime.h"
-      ;
+    std::string kernel_header = (
+#include "taichi/backends/opengl/shaders/runtime.h"
+        );
+    if (used.listman)
+      kernel_header += (
+#include "taichi/backends/opengl/shaders/listman.h"
+          );
 #undef __GLSL__
     kernel_header +=
       "layout(std430, binding = 0) buffer data_i32 { int _data_i32_[]; };\n"
-      "layout(std430, binding = 0) buffer data_f32 { float _data_f32_[]; };\n"
-      "layout(std430, binding = 0) buffer data_f64 { double _data_f64_[]; };\n";
+      "layout(std430, binding = 0) buffer data_f32 { float _data_f32_[]; };\n";
+    if (used.float64)
+      kernel_header += "layout(std430, binding = 0) buffer data_f64 { double _data_f64_[]; };\n";
     if (used.int64)
       kernel_header += "layout(std430, binding = 0) buffer data_i64 { int64_t _data_i64_[]; };\n";
 
-    if (used.global_temp) {
+    if (used.buf_gtmp) {
       kernel_header +=
           "layout(std430, binding = 1) buffer gtmp_i32 { int _gtmp_i32_[]; };\n"
-          "layout(std430, binding = 1) buffer gtmp_f32 { float _gtmp_f32_[]; };\n"
-          "layout(std430, binding = 1) buffer gtmp_f64 { double _gtmp_f64_[]; };\n";
+          "layout(std430, binding = 1) buffer gtmp_f32 { float _gtmp_f32_[]; };\n";
+      if (used.float64)
+        kernel_header += "layout(std430, binding = 1) buffer gtmp_f64 { double _gtmp_f64_[]; };\n";
       if (used.int64)
         kernel_header += "layout(std430, binding = 1) buffer gtmp_i64 { int64_t _gtmp_i64_[]; };\n";
     }
-    if (used.argument) {
+    if (used.buf_args) {
       kernel_header +=
           "layout(std430, binding = 2) buffer args_i32 { int _args_i32_[]; };\n"
-          "layout(std430, binding = 2) buffer args_f32 { float _args_f32_[]; };\n"
-          "layout(std430, binding = 2) buffer args_f64 { double _args_f64_[]; };\n";
+          "layout(std430, binding = 2) buffer args_f32 { float _args_f32_[]; };\n";
+      if (used.float64)
+        kernel_header += "layout(std430, binding = 2) buffer args_f64 { double _args_f64_[]; };\n";
       if (used.int64)
         kernel_header += "layout(std430, binding = 2) buffer args_i64 { int64_t _args_i64_[]; };\n";
     }
-    if (used.extra_arg) {
+    if (used.buf_earg) {
       kernel_header +=
           "layout(std430, binding = 3) buffer earg_i32 { int _earg_i32_[]; };\n";
     }
-    if (used.external_ptr) {
+    if (used.buf_extr) {
       kernel_header +=
           "layout(std430, binding = 4) buffer extr_i32 { int _extr_i32_[]; };\n"
-          "layout(std430, binding = 4) buffer extr_f32 { float _extr_f32_[]; };\n"
-          "layout(std430, binding = 4) buffer extr_f64 { double _extr_f64_[]; };\n";
+          "layout(std430, binding = 4) buffer extr_f32 { float _extr_f32_[]; };\n";
+      if (used.float64)
+        kernel_header += "layout(std430, binding = 4) buffer extr_f64 { double _extr_f64_[]; };\n";
       if (used.int64)
         kernel_header += "layout(std430, binding = 4) buffer extr_i64 { int64_t _extr_i64_[]; };\n";
     }
@@ -154,23 +189,23 @@ class KernelGen : public IRVisitor {
       kernel_header += (
 #include "taichi/backends/opengl/shaders/atomics_data_f32.glsl.h"
       );
-      if (used.global_temp) {
+      if (used.buf_gtmp) {
         kernel_header += (
 #include "taichi/backends/opengl/shaders/atomics_gtmp_f32.glsl.h"
         );
       }
-      if (used.external_ptr) {
+      if (used.buf_extr) {
         kernel_header += (
 #include "taichi/backends/opengl/shaders/atomics_extr_f32.glsl.h"
         );
       }
     }
-    if (used.random) {  // TODO(archibate): random in different offloads should
-                        // share rand seed? {{{
+    // TODO(archibate): random in different offloads should share rand seed?
+    if (used.random) {
       kernel_header += (
 #include "taichi/backends/opengl/shaders/random.glsl.h"
       );
-    }  // }}}
+    }
 
     if (used.fast_pow) {
       kernel_header += (
@@ -185,13 +220,9 @@ class KernelGen : public IRVisitor {
 
     line_appender_header_.append_raw(kernel_header);
 
-    emit(
-        "layout(local_size_x = {} /* {}, {} */, "
-        "local_size_y = 1, local_size_z = 1) in;",
-        kpa.threads_per_group, kpa.num_groups, kpa.num_threads);
     std::string extensions = "";
 #define PER_OPENGL_EXTENSION(x) \
-  if (opengl_has_##x)           \
+  if (used.extension_##x)       \
     extensions += "#extension " #x ": enable\n";
 #include "taichi/inc/opengl_extension.inc.h"
 #undef PER_OPENGL_EXTENSION
@@ -199,10 +230,10 @@ class KernelGen : public IRVisitor {
         "#version 430 core\n" + extensions + "precision highp float;\n" +
         line_appender_header_.lines() + line_appender_.lines();
     compiled_program_->add(std::move(glsl_kernel_name_), kernel_src_code,
-                           std::move(kpa));
+                           std::move(ps));
     line_appender_header_.clear_all();
     line_appender_.clear_all();
-    kpa = KernelParallelAttrib();
+    ps = std::make_unique<ParallelSize_ConstRange>(0);
   }
 
   void visit(Block *stmt) override {
@@ -229,14 +260,15 @@ class KernelGen : public IRVisitor {
     }
     auto msgid_name = fmt::format("_mi_{}", stmt->short_name());
     emit("int {} = atomicAdd(_msg_count_, 1);", msgid_name);
+    emit("{} %= {};", msgid_name, MAX_MESSAGES);
     for (int i = 0; i < size; i++) {
       auto const &content = stmt->contents[i];
 
       if (std::holds_alternative<Stmt *>(content)) {
         auto arg_stmt = std::get<Stmt *>(content);
         emit("_msg_set_{}({}, {}, {});",
-             opengl_data_type_short_name(arg_stmt->ret_type.data_type),
-             msgid_name, i, arg_stmt->short_name());
+             opengl_data_type_short_name(arg_stmt->ret_type), msgid_name, i,
+             arg_stmt->short_name());
 
       } else {
         auto str = std::get<std::string>(content);
@@ -249,9 +281,8 @@ class KernelGen : public IRVisitor {
 
   void visit(RandStmt *stmt) override {
     used.random = true;
-    emit("{} {} = _rand_{}();", opengl_data_type_name(stmt->ret_type.data_type),
-         stmt->short_name(),
-         opengl_data_type_short_name(stmt->ret_type.data_type));
+    emit("{} {} = _rand_{}();", opengl_data_type_name(stmt->ret_type),
+         stmt->short_name(), opengl_data_type_short_name(stmt->ret_type));
   }
 
   void visit(LinearizeStmt *stmt) override {
@@ -263,9 +294,9 @@ class KernelGen : public IRVisitor {
     emit("int {} = {};", stmt->short_name(), val);
   }
 
-  void visit(OffsetAndExtractBitsStmt *stmt) override {
-    emit("int {} = ((({} + {}) >> {}) & ((1 << {}) - 1));", stmt->short_name(),
-         stmt->offset, stmt->input->short_name(), stmt->bit_begin,
+  void visit(BitExtractStmt *stmt) override {
+    emit("int {} = (({} >> {}) & ((1 << {}) - 1));", stmt->short_name(),
+         stmt->input->short_name(), stmt->bit_begin,
          stmt->bit_end - stmt->bit_begin);
   }
 
@@ -291,6 +322,78 @@ class KernelGen : public IRVisitor {
          parent->short_name(),
          struct_compiled_->snode_map.at(parent_type).elem_stride,
          stmt->input_index->short_name(), stmt->snode->node_type_name);
+
+    if (stmt->activate) {
+      if (stmt->snode->type == SNodeType::dense) {
+        // do nothing
+      } else if (stmt->snode->type == SNodeType::dynamic) {
+        emit("atomicMax(_data_i32_[{} >> 2], {} + 1); // dynamic activate",
+             get_snode_meta_address(stmt->snode),
+             stmt->input_index->short_name());
+      } else {
+        TI_NOT_IMPLEMENTED
+      }
+    }
+  }
+
+  void visit(SNodeOpStmt *stmt) override {  // IAPR?
+    if (stmt->op_type == SNodeOpType::activate) {
+      if (stmt->snode->type == SNodeType::dense ||
+          stmt->snode->type == SNodeType::root) {
+        // do nothing
+      } else if (stmt->snode->type == SNodeType::dynamic) {
+        emit("atomicMax(_data_i32_[{} >> 2], {} + 1); // dynamic activate",
+             get_snode_meta_address(stmt->snode), stmt->val->short_name());
+      } else {
+        TI_NOT_IMPLEMENTED
+      }
+
+    } else if (stmt->op_type == SNodeOpType::deactivate) {
+      if (stmt->snode->type == SNodeType::dense ||
+          stmt->snode->type == SNodeType::root) {
+        // do nothing
+      } else if (stmt->snode->type == SNodeType::dynamic) {
+        emit("_data_i32_[{} >> 2] = 0; // dynamic deactivate",
+             get_snode_meta_address(stmt->snode), stmt->val->short_name());
+      } else {
+        TI_NOT_IMPLEMENTED
+      }
+
+    } else if (stmt->op_type == SNodeOpType::is_active) {
+      TI_ASSERT(stmt->ret_type->is_primitive(PrimitiveTypeID::i32));
+      if (stmt->snode->type == SNodeType::dense ||
+          stmt->snode->type == SNodeType::root) {
+        emit("int {} = 1;", stmt->short_name());
+      } else if (stmt->snode->type == SNodeType::dynamic) {
+        emit("int {} = int({} < _data_i32_[{} >> 2]);", stmt->short_name(),
+             stmt->val->short_name(), get_snode_meta_address(stmt->snode));
+      } else {
+        TI_NOT_IMPLEMENTED
+      }
+
+    } else if (stmt->op_type == SNodeOpType::append) {
+      TI_ASSERT(stmt->snode->type == SNodeType::dynamic);
+      TI_ASSERT(stmt->ret_type->is_primitive(PrimitiveTypeID::i32));
+      emit("int {} = atomicAdd(_data_i32_[{} >> 2], 1);", stmt->short_name(),
+           get_snode_meta_address(stmt->snode));
+      auto dt = stmt->val->element_type();
+      emit("int _ad_{} = {} + {} * {};", stmt->short_name(),
+           get_snode_base_address(stmt->snode), stmt->short_name(),
+           struct_compiled_->snode_map.at(stmt->snode->node_type_name)
+               .elem_stride);
+      emit("_data_{}_[_ad_{} >> {}] = {};", opengl_data_type_short_name(dt),
+           stmt->short_name(), opengl_data_address_shifter(dt),
+           stmt->val->short_name());
+
+    } else if (stmt->op_type == SNodeOpType::length) {
+      TI_ASSERT(stmt->snode->type == SNodeType::dynamic);
+      TI_ASSERT(stmt->ret_type->is_primitive(PrimitiveTypeID::i32));
+      emit("int {} = _data_i32_[{} >> 2];", stmt->short_name(),
+           get_snode_meta_address(stmt->snode));
+
+    } else {
+      TI_NOT_IMPLEMENTED
+    }
   }
 
   std::map<int, std::string> ptr_signats;
@@ -335,7 +438,7 @@ class KernelGen : public IRVisitor {
       const int num_indices = stmt->indices.size();
       std::vector<std::string> size_var_names;
       for (int i = 0; i < num_indices; i++) {
-        used.extra_arg = true;
+        used.buf_earg = true;
         std::string var_name = fmt::format("_s{}_{}", i, stmt->short_name());
         emit("int {} = _earg_i32_[{} * {} + {}];", var_name, arg_id,
              taichi_max_num_indices, i);
@@ -351,7 +454,7 @@ class KernelGen : public IRVisitor {
     emit("int {} = {} + ({} << {});", stmt->short_name(),
          stmt->base_ptrs[0]->short_name(), linear_index_name,
          opengl_data_address_shifter(stmt->base_ptrs[0]->element_type()));
-    used.external_ptr = true;
+    used.buf_extr = true;
     ptr_signats[stmt->id] = "extr";
   }
 
@@ -364,7 +467,7 @@ class KernelGen : public IRVisitor {
       emit("{} {} = {}(-{});", dt_name, stmt->short_name(), dt_name,
            stmt->operand->short_name());
     } else if (stmt->op_type == UnaryOpType::rsqrt) {
-      emit("{} {} = {}(1 / sqrt({}));", dt_name, stmt->short_name(), dt_name,
+      emit("{} {} = {}(inversesqrt({}));", dt_name, stmt->short_name(), dt_name,
            stmt->operand->short_name());
     } else if (stmt->op_type == UnaryOpType::sgn) {
       emit("{} {} = {}(sign({}));", dt_name, stmt->short_name(), dt_name,
@@ -376,12 +479,13 @@ class KernelGen : public IRVisitor {
       emit("{} {} = {}({});", dt_name, stmt->short_name(),
            opengl_data_type_name(stmt->cast_type), stmt->operand->short_name());
     } else if (stmt->op_type == UnaryOpType::cast_bits) {
-      if (stmt->cast_type == DataType::f32 &&
-          stmt->operand->element_type() == DataType::i32) {
+      if (stmt->cast_type->is_primitive(PrimitiveTypeID::f32) &&
+          stmt->operand->element_type()->is_primitive(PrimitiveTypeID::i32)) {
         emit("{} {} = intBitsToFloat({});", dt_name, stmt->short_name(),
              stmt->operand->short_name());
-      } else if (stmt->cast_type == DataType::i32 &&
-                 stmt->operand->element_type() == DataType::f32) {
+      } else if (stmt->cast_type->is_primitive(PrimitiveTypeID::i32) &&
+                 stmt->operand->element_type()->is_primitive(
+                     PrimitiveTypeID::f32)) {
         emit("{} {} = floatBitsToInt({});", dt_name, stmt->short_name(),
              stmt->operand->short_name());
       } else {
@@ -399,6 +503,7 @@ class KernelGen : public IRVisitor {
     const auto rhs_name = bin->rhs->short_name();
     const auto bin_name = bin->short_name();
     if (bin->op_type == BinaryOpType::floordiv) {
+      TI_WARN("floordiv called! It should be taken care by demote_operations");
       if (is_integral(bin->lhs->element_type()) &&
           is_integral(bin->rhs->element_type())) {
         emit(
@@ -423,7 +528,7 @@ class KernelGen : public IRVisitor {
       return;
     } else if (bin->op_type == BinaryOpType::atan2) {
       if (bin->element_type() ==
-          DataType::f64) {  // don't know why no atan(double, double)
+          PrimitiveType::f64) {  // don't know why no atan(double, double)
         emit("{} {} = {}(atan(float({}), float({})));", dt_name, bin_name,
              dt_name, lhs_name, rhs_name);
       } else {
@@ -468,13 +573,16 @@ class KernelGen : public IRVisitor {
 
   void visit(AtomicOpStmt *stmt) override {
     TI_ASSERT(stmt->width() == 1);
-    auto dt = stmt->dest->element_type();
-    if (dt == DataType::i32 ||
-        (opengl_has_GL_NV_shader_atomic_int64 && dt == DataType::i64) ||
+    auto dt = stmt->dest->element_type().ptr_removed();
+    if (dt->is_primitive(PrimitiveTypeID::i32) ||
+        (TI_OPENGL_REQUIRE(used, GL_NV_shader_atomic_int64) &&
+         dt->is_primitive(PrimitiveTypeID::i64)) ||
         ((stmt->op_type == AtomicOpType::add ||
           stmt->op_type == AtomicOpType::sub) &&
-         ((opengl_has_GL_NV_shader_atomic_float && dt == DataType::f32) ||
-          (opengl_has_GL_NV_shader_atomic_float64 && dt == DataType::f64)))) {
+         ((TI_OPENGL_REQUIRE(used, GL_NV_shader_atomic_float) &&
+           dt->is_primitive(PrimitiveTypeID::f32)) ||
+          (TI_OPENGL_REQUIRE(used, GL_NV_shader_atomic_float64) &&
+           dt->is_primitive(PrimitiveTypeID::f64))))) {
       emit("{} {} = {}(_{}_{}_[{} >> {}], {});",
            opengl_data_type_name(stmt->val->element_type()), stmt->short_name(),
            opengl_atomic_op_type_cap_name(stmt->op_type),
@@ -482,9 +590,9 @@ class KernelGen : public IRVisitor {
            stmt->dest->short_name(), opengl_data_address_shifter(dt),
            stmt->val->short_name());
     } else {
-      if (dt != DataType::f32) {
+      if (dt != PrimitiveType::f32) {
         TI_ERROR(
-            "unsupported atomic operation for DataType::{}, "
+            "unsupported atomic operation for PrimitiveType::{}, "
             "this may because your OpenGL is missing that extension, "
             "see `glewinfo` for more details",
             opengl_data_type_short_name(dt));
@@ -529,18 +637,19 @@ class KernelGen : public IRVisitor {
   }
 
   void visit(AllocaStmt *alloca) override {
-    emit("{} {} = 0;", opengl_data_type_name(alloca->element_type()),
-         alloca->short_name());
+    auto dt_name = opengl_data_type_name(alloca->element_type());
+    emit("{} {} = {}(0);", dt_name, alloca->short_name(), dt_name);
   }
 
   void visit(ConstStmt *const_stmt) override {
     TI_ASSERT(const_stmt->width() == 1);
-    emit("{} {} = {};", opengl_data_type_name(const_stmt->element_type()),
-         const_stmt->short_name(), const_stmt->val[0].stringify());
+    auto dt_name = opengl_data_type_name(const_stmt->element_type());
+    emit("{} {} = {}({});", dt_name, const_stmt->short_name(), dt_name,
+         const_stmt->val[0].stringify());
   }
 
   void visit(KernelReturnStmt *stmt) override {
-    used.argument = true;
+    used.buf_args = true;
     // TODO: consider use _rets_{}_ instead of _args_{}_
     // TODO: use stmt->ret_id instead of 0 as index
     emit("_args_{}_[0] = {};",
@@ -550,7 +659,7 @@ class KernelGen : public IRVisitor {
 
   void visit(ArgLoadStmt *stmt) override {
     const auto dt = opengl_data_type_name(stmt->element_type());
-    used.argument = true;
+    used.buf_args = true;
     if (stmt->is_ptr) {
       emit("int {} = _args_i32_[{} << 1]; // is ext pointer {}",
            stmt->short_name(), stmt->arg_id, dt);
@@ -559,6 +668,45 @@ class KernelGen : public IRVisitor {
            opengl_data_type_short_name(stmt->element_type()), stmt->arg_id,
            opengl_argument_address_shifter(stmt->element_type()));
     }
+  }
+
+  void visit(ExternalFuncCallStmt *stmt) override {
+    TI_ASSERT(!stmt->func);
+    auto format = stmt->source;
+    std::string source;
+
+    for (int i = 0; i < format.size(); i++) {
+      char c = format[i];
+      if (c == '%' || c == '$') {  // '$' for output, '%' for input
+        int num = 0;
+        while (i < format.size()) {
+          i += 1;
+          if (!::isdigit(format[i])) {
+            i -= 1;
+            break;
+          }
+          num *= 10;
+          num += format[i] - '0';
+        }
+        auto args = (c == '%') ? stmt->arg_stmts : stmt->output_stmts;
+        TI_ASSERT_INFO(num < args.size(), "{}{} out of {} argument range {}", c,
+                       num, ((c == '%') ? "input" : "output"), args.size());
+        source += args[num]->short_name();
+      } else {
+        source.push_back(c);
+      }
+    }
+
+    emit("{};", source);
+  }
+
+  void visit(ExternalTensorShapeAlongAxisStmt *stmt) override {
+    const auto name = stmt->short_name();
+    const auto arg_id = stmt->arg_id;
+    const auto axis = stmt->axis;
+    used.buf_earg = true;
+    emit("int {} = _earg_i32_[{} * {} + {}];", name, arg_id,
+         taichi_max_num_indices, axis);
   }
 
   std::string make_kernel_name() {
@@ -575,6 +723,45 @@ class KernelGen : public IRVisitor {
     emit("}}\n");
   }
 
+  void generate_grid_stride_loop_header() {
+    ScopedIndent _s(line_appender_);
+  }
+
+  struct ScopedGridStrideLoop {
+    KernelGen *gen;
+    std::unique_ptr<ScopedIndent> s;
+
+    ScopedGridStrideLoop(KernelGen *gen) : gen(gen) {
+      // TODO(archibate): what's grid dim actually?
+      size_t stride_size = gen->kernel->program.config.saturating_grid_dim;
+      if (gen->used_tls && stride_size == 0) {
+        // automatically enable grid-stride-loop when TLS used:
+        stride_size = 32;  // seems to be the most optimal number for fem99.py
+      }
+      if (stride_size != 0) {
+        gen->is_grid_stride_loop_ = true;
+        gen->emit("int _sid0 = int(gl_GlobalInvocationID.x) * {};",
+                  stride_size);
+        gen->emit("for (int _sid = _sid0; _sid < _sid0 + {}; _sid++) {{",
+                  stride_size);
+        s = std::make_unique<ScopedIndent>(gen->line_appender_);
+        TI_ASSERT(gen->ps);
+        gen->ps->strides_per_thread = stride_size;
+
+      } else {  // zero regression
+        gen->emit("int _sid = int(gl_GlobalInvocationID.x);");
+      }
+    }
+
+    ~ScopedGridStrideLoop() {
+      if (s)
+        gen->emit("}}");
+      s = nullptr;
+
+      gen->is_grid_stride_loop_ = false;
+    }
+  };
+
   void generate_range_for_kernel(OffloadedStmt *stmt) {
     TI_ASSERT(stmt->task_type == OffloadedStmt::TaskType::range_for);
     const std::string glsl_kernel_name = make_kernel_name();
@@ -582,53 +769,173 @@ class KernelGen : public IRVisitor {
     this->glsl_kernel_name_ = glsl_kernel_name;
     emit("{{ // range for");
 
+    used_tls = (stmt->tls_prologue != nullptr);
+    if (used_tls) {
+      TI_ASSERT(stmt->tls_prologue != nullptr);
+      auto tls_size = stmt->tls_size;
+      emit("int _tls_i32_[{}];", (tls_size + 3) / 4);
+      emit("float _tls_f32_[{}];", (tls_size + 3) / 4);
+      if (used.float64)
+        emit("double _tls_f64_[{}];", (tls_size + 7) / 8);
+      if (used.int64)
+        emit("int64_t _tls_i64_[{}];", (tls_size + 7) / 8);
+      emit("{{  // TLS prologue");
+      stmt->tls_prologue->accept(this);
+      emit("}}");
+    }
+
     if (stmt->const_begin && stmt->const_end) {
       ScopedIndent _s(line_appender_);
+      emit("// range known at compile time");
       auto begin_value = stmt->begin_value;
       auto end_value = stmt->end_value;
       if (end_value < begin_value)
-        std::swap(end_value, begin_value);
-      kpa = KernelParallelAttrib(end_value - begin_value);
-      emit("// range known at compile time");
-      emit("int _tid = int(gl_GlobalInvocationID.x);");
-      emit("if (_tid >= {}) return;", end_value - begin_value);
-      emit("int _itv = {} + _tid * {};", begin_value, 1 /* stmt->step? */);
+        end_value = begin_value;
+      ps = std::make_unique<ParallelSize_ConstRange>(end_value - begin_value);
+      ps->threads_per_block = stmt->block_dim;
+      ScopedGridStrideLoop _gsl(this);
+      emit("if (_sid >= {}) {};", end_value - begin_value, get_return_stmt());
+      emit("int _itv = {} + _sid * {};", begin_value, 1 /* stmt->step? */);
       stmt->body->accept(this);
     } else {
-      {
-        ScopedIndent _s(line_appender_);
-        emit("// range known at runtime");
-        auto begin_expr = stmt->const_begin ? std::to_string(stmt->begin_value)
-                                            : fmt::format("_gtmp_i32_[{} >> 2]",
-                                                          stmt->begin_offset);
-        auto end_expr = stmt->const_end ? std::to_string(stmt->end_value)
-                                        : fmt::format("_gtmp_i32_[{} >> 2]",
-                                                      stmt->end_offset);
-        emit("int _tid = int(gl_GlobalInvocationID.x);");
-        emit("int _beg = {}, _end = {};", begin_expr, end_expr);
-        emit("int _itv = _beg + _tid;");
-        emit("if (_itv >= _end) return;");
-        kpa = KernelParallelAttrib(stmt);
-      }
+      ScopedIndent _s(line_appender_);
+      emit("// range known at runtime");
+      auto begin_expr = stmt->const_begin ? std::to_string(stmt->begin_value)
+                                          : fmt::format("_gtmp_i32_[{} >> 2]",
+                                                        stmt->begin_offset);
+      auto end_expr = stmt->const_end ? std::to_string(stmt->end_value)
+                                      : fmt::format("_gtmp_i32_[{} >> 2]",
+                                                    stmt->end_offset);
+      ps = std::make_unique<ParallelSize_DynamicRange>(stmt);
+      ps->threads_per_block = stmt->block_dim;
+      ScopedGridStrideLoop _gsl(this);
+      emit("int _beg = {}, _end = {};", begin_expr, end_expr);
+      emit("int _itv = _beg + _sid;");
+      emit("if (_itv >= _end) {};", get_return_stmt());
       stmt->body->accept(this);
     }
 
+    if (used_tls) {
+      TI_ASSERT(stmt->tls_epilogue != nullptr);
+      emit("{{  // TLS epilogue");
+      stmt->tls_epilogue->accept(this);
+      emit("}}");
+    }
+    used_tls = false;
+
+    emit("}}\n");
+  }
+
+  void generate_struct_for_kernel(OffloadedStmt *stmt) {
+    TI_ASSERT(stmt->task_type == OffloadedStmt::TaskType::struct_for);
+    used.listman = true;
+    const std::string glsl_kernel_name = make_kernel_name();
+    emit("void {}()", glsl_kernel_name);
+    this->glsl_kernel_name_ = glsl_kernel_name;
+    emit("{{ // struct for {}", stmt->snode->node_type_name);
+    {
+      ScopedIndent _s(line_appender_);
+      ps = std::make_unique<ParallelSize_StructFor>(stmt);
+      ps->threads_per_block = stmt->block_dim;
+      ScopedGridStrideLoop _gsl(this);
+      emit("if (_sid >= _end) {};", get_return_stmt());
+      emit("int _itv = _list_[_sid];");
+      stmt->body->accept(this);
+    }
+    emit("}}\n");
+  }
+
+  size_t get_snode_base_address(const SNode *snode) {
+    if (snode->type == SNodeType::root)
+      return 0;
+    int chid = find_children_id(snode);
+    const auto &parent_meta =
+        struct_compiled_->snode_map.at(snode->parent->node_type_name);
+    auto choff = parent_meta.children_offsets[chid];
+    return choff + get_snode_base_address(snode->parent);
+  }
+
+  size_t get_snode_meta_address(const SNode *snode) {
+    auto addr = get_snode_base_address(snode);
+    addr += struct_compiled_->snode_map.at(snode->node_type_name).stride;
+    addr -= opengl_get_snode_meta_size(*snode);
+    return addr;
+  }
+
+  void generate_listgen_for_dynamic(const SNode *snode) {
+    TI_ASSERT(snode->type == SNodeType::dynamic);
+    // the `length` field of a dynamic SNode is at it's end:
+    // | x[0] | x[1] | x[2] | x[3] | ... | len |
+    TI_ASSERT_INFO(snode->parent->type == SNodeType::root,
+                   "Non-top-level dynamic not supported yet on OpenGL");
+    size_t addr = get_snode_meta_address(snode);
+    emit("_list_len_ = _data_i32_[{} >> 2];", addr);
+    emit("for (int i = 0; i < _list_len_; i++) {{");
+    {
+      ScopedIndent _s(line_appender_);
+      emit("_list_[i] = i;");
+    }
+    emit("}}");
+  }
+
+  void generate_listgen_for_dense(const SNode *snode) {
+    TI_ASSERT(snode->type == SNodeType::dense);
+    // the `length` field of a dynamic SNode is at it's end:
+    // | x[0] | x[1] | x[2] | x[3] | ... | len |
+    emit("_list_len_ = {};",
+         struct_compiled_->snode_map[snode->node_type_name].length);
+    emit("for (int i = 0; i < _list_len_; i++) {{");
+    {
+      ScopedIndent _s(line_appender_);
+      emit("_list_[i] = i;");
+    }
+    emit("}}");
+  }
+
+  void generate_listgen_kernel(OffloadedStmt *stmt) {
+    TI_ASSERT(stmt->task_type == OffloadedStmt::TaskType::listgen);
+    const std::string glsl_kernel_name = make_kernel_name();
+    emit("void {}()", glsl_kernel_name);
+    this->glsl_kernel_name_ = glsl_kernel_name;
+    used.listman = true;
+    emit("{{ // listgen {}", stmt->snode->node_type_name);
+    {
+      ScopedIndent _s(line_appender_);
+      if (stmt->snode->type == SNodeType::dense) {
+        generate_listgen_for_dense(stmt->snode);
+      } else if (stmt->snode->type == SNodeType::dynamic) {
+        generate_listgen_for_dynamic(stmt->snode);
+      } else {
+        TI_NOT_IMPLEMENTED
+      }
+    }
     emit("}}\n");
   }
 
   void visit(GlobalTemporaryStmt *stmt) override {
     TI_ASSERT(stmt->width() == 1);
-    used.global_temp = true;
+    used.buf_gtmp = true;
     emit("int {} = {};", stmt->short_name(), stmt->offset);
     ptr_signats[stmt->id] = "gtmp";
+  }
+
+  void visit(ThreadLocalPtrStmt *stmt) override {
+    TI_ASSERT(stmt->width() == 1);
+    emit("int {} = {};", stmt->short_name(), stmt->offset);
+    ptr_signats[stmt->id] = "tls";
   }
 
   void visit(LoopIndexStmt *stmt) override {
     TI_ASSERT(stmt->index == 0);  // TODO: multiple indices
     if (stmt->loop->is<OffloadedStmt>()) {
-      TI_ASSERT(stmt->loop->as<OffloadedStmt>()->task_type ==
-                OffloadedStmt::TaskType::range_for);
-      emit("int {} = _itv;", stmt->short_name());
+      auto type = stmt->loop->as<OffloadedStmt>()->task_type;
+      if (type == OffloadedStmt::TaskType::range_for) {
+        emit("int {} = _itv;", stmt->short_name());
+      } else if (type == OffloadedStmt::TaskType::struct_for) {
+        emit("int {} = _itv; // struct for", stmt->short_name());
+      } else {
+        TI_NOT_IMPLEMENTED
+      }
     } else if (stmt->loop->is<RangeForStmt>()) {
       emit("int {} = {};", stmt->short_name(), stmt->loop->short_name());
     } else {
@@ -640,15 +947,15 @@ class KernelGen : public IRVisitor {
     TI_ASSERT(for_stmt->width() == 1);
     auto loop_var_name = for_stmt->short_name();
     if (!for_stmt->reversed) {
-      emit("for (int {}_ = {}; {}_ < {}; {}_ = {}_ + {}) {{", loop_var_name,
+      emit("for (int {}_ = {}; {}_ < {}; {}_ += {}) {{", loop_var_name,
            for_stmt->begin->short_name(), loop_var_name,
-           for_stmt->end->short_name(), loop_var_name, loop_var_name, 1);
+           for_stmt->end->short_name(), loop_var_name, 1);
       emit("  int {} = {}_;", loop_var_name, loop_var_name);
     } else {
       // reversed for loop
-      emit("for (int {}_ = {} - 1; {}_ >= {}; {}_ = {}_ - {}) {{",
-           loop_var_name, for_stmt->end->short_name(), loop_var_name,
-           for_stmt->begin->short_name(), loop_var_name, loop_var_name, 1);
+      emit("for (int {}_ = {} - {}; {}_ >= {}; {}_ -= {}) {{", loop_var_name,
+           for_stmt->end->short_name(), 1, loop_var_name,
+           for_stmt->begin->short_name(), loop_var_name, 1);
       emit("  int {} = {}_;", loop_var_name, loop_var_name);
     }
     for_stmt->body->accept(this);
@@ -659,9 +966,14 @@ class KernelGen : public IRVisitor {
     emit("if ({} == 0) break;", stmt->cond->short_name());
   }
 
+  std::string get_return_stmt() {
+    return is_grid_stride_loop_ ? "continue" : "return";
+  }
+
   void visit(ContinueStmt *stmt) override {
+    // stmt->as_return() is unused when embraced with a grid-stride-loop
     if (stmt->as_return()) {
-      emit("return;");
+      emit("{};", get_return_stmt());
     } else {
       emit("continue;");
     }
@@ -682,6 +994,10 @@ class KernelGen : public IRVisitor {
       generate_serial_kernel(stmt);
     } else if (stmt->task_type == Type::range_for) {
       generate_range_for_kernel(stmt);
+    } else if (stmt->task_type == Type::struct_for) {
+      generate_struct_for_kernel(stmt);
+    } else if (stmt->task_type == Type::listgen) {
+      generate_listgen_kernel(stmt);
     } else {
       // struct_for is automatically lowered to ranged_for for dense snodes
       // (#378). So we only need to support serial and range_for tasks.
@@ -694,6 +1010,12 @@ class KernelGen : public IRVisitor {
 
   void visit(StructForStmt *) override {
     TI_ERROR("[glsl] Struct for cannot be nested under OpenGL for now");
+  }
+
+  void visit(ClearListStmt *stmt) override {
+    used.listman = true;
+    emit("// clear list {}", stmt->snode->node_type_name);
+    emit("_list_len_ = 0;");
   }
 
   void visit(IfStmt *if_stmt) override {
@@ -747,10 +1069,11 @@ void OpenglCodeGen::lower() {
   auto ir = kernel_->ir.get();
   auto &config = kernel_->program.config;
   config.demote_dense_struct_fors = true;
-  irpass::compile_to_offloads(ir, config,
-                              /*vectorize=*/false, kernel_->grad,
-                              /*ad_use_stack=*/false, config.print_ir,
-                              /*lower_global_access*/ true);
+  irpass::compile_to_executable(ir, config,
+                                /*vectorize=*/false, kernel_->grad,
+                                /*ad_use_stack=*/false, config.print_ir,
+                                /*lower_global_access=*/true,
+                                /*make_thread_local=*/config.make_thread_local);
 #ifdef _GLSL_DEBUG
   irpass::print(ir);
 #endif

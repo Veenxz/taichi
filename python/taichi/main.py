@@ -50,29 +50,16 @@ def register(func):
 
 @registerableCLI
 class TaichiMain:
-    def __init__(self, debug: bool = False, test_mode: bool = False):
+    def __init__(self, test_mode: bool = False):
         self.banner = f"\n{'*' * 43}\n**      Taichi Programming Language      **\n{'*' * 43}"
         print(self.banner)
 
-        if 'TI_DEBUG' in os.environ:
-            val = os.environ['TI_DEBUG']
-            if val not in ['0', '1']:
-                raise ValueError(
-                    "Environment variable TI_DEBUG can only have value 0 or 1."
-                )
-        if debug:
-            print(f"\n{'*' * 17} Debug Mode {'*' * 17}\n")
-            os.environ['TI_DEBUG'] = '1'
+        print(self._get_friend_links())
 
         parser = argparse.ArgumentParser(description="Taichi CLI",
                                          usage=self._usage())
         parser.add_argument('command',
                             help="command from the above list to run")
-
-        # Print help if no command provided
-        if len(sys.argv[1:2]) == 0:
-            parser.print_help()
-            exit(1)
 
         # Flag for unit testing
         self.test_mode = test_mode
@@ -81,6 +68,11 @@ class TaichiMain:
 
     @timer
     def __call__(self):
+        # Print help if no command provided
+        if len(sys.argv[1:2]) == 0:
+            self.main_parser.print_help()
+            return 1
+
         # Parse the command
         args = self.main_parser.parse_args(sys.argv[1:2])
 
@@ -88,11 +80,25 @@ class TaichiMain:
             # TODO: do we really need this?
             if args.command.endswith(".py"):
                 TaichiMain._exec_python_file(args.command)
-            print(f"{args.command} is not a valid command!")
-            self.main_parser.print_help()
-            exit(1)
+            else:
+                print(f"{args.command} is not a valid command!")
+                self.main_parser.print_help()
+            return 1
 
         return getattr(self, args.command)(sys.argv[2:])
+
+    def _get_friend_links(self):
+        uri = 'en/stable'
+        try:
+            import locale
+            if 'zh' in locale.getdefaultlocale()[0]:
+                uri = 'zh_CN/latest'
+        except:
+            pass
+        return '\n' \
+               f'Docs:   https://taichi.rtfd.io/{uri}\n' \
+               f'GitHub: https://github.com/taichi-dev/taichi\n' \
+               f'Forum:  https://forum.taichi.graphics\n'
 
     def _usage(self) -> str:
         """Compose deterministic usage message based on registered_commands."""
@@ -151,16 +157,61 @@ class TaichiMain:
             help=f"Name of an example (supports .py extension too)\n",
             type=TaichiMain._example_choices_type(choices),
             choices=sorted(choices))
+        parser.add_argument(
+            '-p',
+            '--print',
+            required=False,
+            dest='print',
+            action='store_true',
+            help="Print example source code instead of running it")
+        parser.add_argument(
+            '-P',
+            '--pretty-print',
+            required=False,
+            dest='pretty_print',
+            action='store_true',
+            help="Like --print, but print in a rich format with line numbers")
+        parser.add_argument(
+            '-s',
+            '--save',
+            required=False,
+            dest='save',
+            action='store_true',
+            help="Save source code to current directory instead of running it")
         args = parser.parse_args(arguments)
 
         examples_dir = TaichiMain._get_examples_dir()
         target = str((examples_dir / f"{args.name}.py").resolve())
         # path for examples needs to be modified for implicit relative imports
         sys.path.append(str(examples_dir.resolve()))
-        print(f"Running example {args.name} ...")
 
         # Short circuit for testing
         if self.test_mode: return args
+
+        if args.save:
+            print(f"Saving example {args.name} to current directory...")
+            shutil.copy(target, '.')
+            return 0
+
+        if args.pretty_print:
+            try:
+                import rich.syntax
+                import rich.console
+            except ImportError as e:
+                print('To make -P work, please: python3 -m pip install rich')
+                return 1
+            # https://rich.readthedocs.io/en/latest/syntax.html
+            syntax = rich.syntax.Syntax.from_path(target, line_numbers=True)
+            console = rich.console.Console()
+            console.print(syntax)
+            return 0
+
+        if args.print:
+            with open(target) as f:
+                print(f.read())
+            return 0
+
+        print(f"Running example {args.name} ...")
 
         runpy.run_path(target, run_name='__main__')
 
@@ -453,9 +504,11 @@ class TaichiMain:
             help="A commit hash that git can use to compare diff with")
         args = parser.parse_args(arguments)
 
+        from .code_format import main
+
         # Short circuit for testing
         if self.test_mode: return args
-        ti.core.format(diff=args.diff)
+        main(diff=args.diff)
 
     @register
     def format_all(self, arguments: list = sys.argv[2:]):
@@ -464,9 +517,11 @@ class TaichiMain:
             prog='ti format_all', description=f"{self.format_all.__doc__}")
         args = parser.parse_args(arguments)
 
+        from .code_format import main
+
         # Short circuit for testing
         if self.test_mode: return args
-        ti.core.format(all=True)
+        main(all=True)
 
     @register
     def build(self, arguments: list = sys.argv[2:]):
@@ -657,6 +712,21 @@ class TaichiMain:
             pytest_args += ['-s', '-v']
         if args.rerun:
             pytest_args += ['--reruns', args.rerun]
+        try:
+            if args.coverage:
+                pytest_args += ['--cov-branch', '--cov=python/taichi']
+            if args.cov_append:
+                pytest_args += ['--cov-append']
+            if args.keys:
+                pytest_args += ['-k', args.keys]
+            if args.marks:
+                pytest_args += ['-m', args.marks]
+            if args.failed_first:
+                pytest_args += ['--failed-first']
+            if args.fail_fast:
+                pytest_args += ['--exitfirst']
+        except AttributeError:
+            pass
 
         try:
             from multiprocessing import cpu_count
@@ -763,6 +833,50 @@ class TaichiMain:
                             dest='rerun',
                             type=str,
                             help='Rerun failed tests for given times')
+        parser.add_argument('-k',
+                            '--keys',
+                            required=False,
+                            default=None,
+                            dest='keys',
+                            type=str,
+                            help='Only run tests that match the keys')
+        parser.add_argument('-m',
+                            '--marks',
+                            required=False,
+                            default=None,
+                            dest='marks',
+                            type=str,
+                            help='Only run tests with specific marks')
+        parser.add_argument('-f',
+                            '--failed-first',
+                            required=False,
+                            default=None,
+                            dest='failed_first',
+                            action='store_true',
+                            help='Run the previously failed test first')
+        parser.add_argument('-x',
+                            '--fail-fast',
+                            required=False,
+                            default=None,
+                            dest='fail_fast',
+                            action='store_true',
+                            help='Exit instantly on the first failed test')
+        parser.add_argument('-C',
+                            '--coverage',
+                            required=False,
+                            default=None,
+                            dest='coverage',
+                            action='store_true',
+                            help='Run tests and record the coverage result')
+        parser.add_argument(
+            '-A',
+            '--cov-append',
+            required=False,
+            default=None,
+            dest='cov_append',
+            action='store_true',
+            help=
+            'Append coverage result to existing one instead of overriding it')
         parser.add_argument(
             '-t',
             '--threads',
@@ -818,6 +932,21 @@ class TaichiMain:
             return TaichiMain._test_cpp(args)
 
     @register
+    def run(self, arguments: list = sys.argv[2:]):
+        """Run a single script"""
+        parser = argparse.ArgumentParser(prog='ti run',
+                                         description=f"{self.run.__doc__}")
+        parser.add_argument(
+            'filename',
+            help='A single (Python) script to run with Taichi, e.g. render.py')
+        args = parser.parse_args(arguments)
+
+        # Short circuit for testing
+        if self.test_mode: return args
+
+        runpy.run_path(args.filename)
+
+    @register
     def debug(self, arguments: list = sys.argv[2:]):
         """Debug a single script"""
         parser = argparse.ArgumentParser(prog='ti debug',
@@ -832,18 +961,15 @@ class TaichiMain:
         if self.test_mode: return args
 
         ti.core.set_core_trigger_gdb_when_crash(True)
+        os.environ['TI_DEBUG'] = '1'
 
-        with open(args.filename) as script:
-            script = script.read()
-
-        # FIXME: exec is a security risk here!
-        exec(script, {'__name__': '__main__'})
+        runpy.run_path(args.filename, run_name='__main__')
 
     @register
-    def run(self, arguments: list = sys.argv[2:]):
+    def task(self, arguments: list = sys.argv[2:]):
         """Run a specific task"""
-        parser = argparse.ArgumentParser(prog='ti run',
-                                         description=f"{self.run.__doc__}")
+        parser = argparse.ArgumentParser(prog='ti task',
+                                         description=f"{self.task.__doc__}")
         parser.add_argument('taskname',
                             help='A single task name to run, e.g. test_math')
         parser.add_argument('taskargs',
@@ -857,16 +983,106 @@ class TaichiMain:
         task = ti.Task(args.taskname)
         task.run(*args.taskargs)
 
+    @register
+    def dist(self, arguments: list = sys.argv[2:]):
+        """Build package and test in release mode"""
+        parser = argparse.ArgumentParser(prog='ti dist',
+                                         description=f"{self.dist.__doc__}")
+        parser.add_argument('mode',
+                            nargs='?',
+                            default='test',
+                            choices=['upload', 'try_upload', 'test'],
+                            help='Which mode shall we run?')
+        args = parser.parse_args(arguments)
+
+        os.chdir(os.path.join(ti.core.get_repo_dir(), 'python'))
+        sys.argv.pop(0)
+        sys.argv.append(args.mode)
+        runpy.run_path('build.py')
+
+    @register
+    def diagnose(self, arguments: list = sys.argv[2:]):
+        """System diagnose information"""
+        parser = argparse.ArgumentParser(
+            prog='ti diagnose', description=f"{self.diagnose.__doc__}")
+        args = parser.parse_args(arguments)
+
+        from .diagnose import main
+        main()
+
+    @register
+    def cc_compose(self, arguments: list = sys.argv[2:]):
+        """Compose C backend action record into a complete C file"""
+        parser = argparse.ArgumentParser(
+            prog='ti cc_compose', description=f"{self.cc_compose.__doc__}")
+        parser.add_argument(
+            'fin_name',
+            help='Action record YAML file name from C backend, e.g. program.yml'
+        )
+        parser.add_argument(
+            'fout_name', help='The output C source file name, e.g. program.c')
+        parser.add_argument(
+            'hdrout_name',
+            help='The output C header file name, e.g. program.h')
+        parser.add_argument(
+            '-e',
+            '--emscripten',
+            required=False,
+            default=False,
+            dest='emscripten',
+            action='store_true',
+            help='Generate output C file for Emscripten instead of raw C')
+        args = parser.parse_args(arguments)
+
+        from .cc_compose import main
+        main(args.fin_name, args.fout_name, args.hdrout_name, args.emscripten)
+
+    @register
+    def repl(self, arguments: list = sys.argv[2:]):
+        """Start Taichi REPL / Python shell with 'import taichi as ti'"""
+        parser = argparse.ArgumentParser(prog='ti repl',
+                                         description=f"{self.repl.__doc__}")
+        args = parser.parse_args(arguments)
+
+        def local_scope():
+            import taichi as ti
+            import numpy as np
+            import math
+            import time
+            try:
+                import IPython
+                IPython.embed()
+            except ImportError:
+                import code
+                __name__ = '__console__'
+                code.interact(local=locals())
+
+        local_scope()
+
+    @register
+    def lint(self, arguments: list = sys.argv[2:]):
+        """Run pylint checker for the Python codebase of Taichi"""
+        parser = argparse.ArgumentParser(prog='ti lint',
+                                         description=f"{self.lint.__doc__}")
+        # TODO: support arguments for lint specific files
+        args = parser.parse_args(arguments)
+
+        options = [os.path.dirname(__file__)]
+
+        from multiprocessing import cpu_count
+        threads = min(8, cpu_count())
+        options += ['-j', str(threads)]
+
+        # http://pylint.pycqa.org/en/latest/user_guide/run.html
+        # TODO: support redirect output to lint.log
+        import pylint.lint
+        pylint.lint.Run(options)
+
 
 def main():
     cli = TaichiMain()
     return cli()
 
 
-def main_debug():
-    cli = TaichiMain(debug=True)
-    return cli()
-
-
 if __name__ == "__main__":
-    exit(main())
+    sys.exit(main())

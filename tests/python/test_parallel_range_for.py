@@ -1,10 +1,11 @@
 import taichi as ti
 
 
-@ti.all_archs
+# such small block_dim will cause grid_dim too large for OpenGL...
+@ti.archs_excluding(ti.opengl)
 def test_parallel_range_for():
     n = 1024 * 1024
-    val = ti.var(ti.i32, shape=(n))
+    val = ti.field(ti.i32, shape=(n))
 
     @ti.kernel
     def fill():

@@ -26,8 +26,7 @@ namespace shaders {
 
 }  // namespace shaders
 
-constexpr size_t kListgenElementSize = sizeof(shaders::ListgenElement);
-constexpr size_t kListManagerSize = sizeof(shaders::ListManager);
+constexpr size_t kListManagerDataSize = sizeof(shaders::ListManagerData);
 constexpr size_t kSNodeMetaSize = sizeof(shaders::SNodeMeta);
 constexpr size_t kSNodeExtractorsSize = sizeof(shaders::SNodeExtractors);
 
@@ -69,15 +68,15 @@ class StructCompiler {
       ++max_snodes_;
     }
 
+    CompiledStructs result;
+    result.root_size = compute_snode_size(&root);
+    emit_runtime_structs();
+    line_appender_.dump(&result.runtime_utils_source_code);
+    result.runtime_size = compute_runtime_size();
     for (auto &n : snodes_rev) {
       generate_types(*n);
     }
-    CompiledStructs result;
-    result.root_size = compute_snode_size(&root);
     line_appender_.dump(&result.snode_structs_source_code);
-    emit_runtime_structs(&root);
-    line_appender_.dump(&result.runtime_utils_source_code);
-    result.runtime_size = compute_runtime_size();
     result.need_snode_lists_data = has_sparse_snode_;
     result.max_snodes = max_snodes_;
     result.snode_descriptors = std::move(snode_descriptors_);
@@ -95,37 +94,97 @@ class StructCompiler {
     }
   }
 
+  void emit_snode_stride(SNodeType ty, const std::string &ch_name, int n) {
+    emit("  constant static constexpr int elem_stride = {}::stride;", ch_name);
+
+    if (ty == SNodeType::bitmasked) {
+      emit(
+          "  constant static constexpr int stride = elem_stride * n + "
+          "/*bitmasked=*/{};",
+          bitmasks_stride(n));
+    } else if (ty == SNodeType::dynamic) {
+      emit(
+          "  constant static constexpr int stride = elem_stride * n + "
+          "/*dynamic=*/{};",
+          kAlignment);
+    } else {
+      // `root`, `dense`
+      emit("  constant static constexpr int stride = elem_stride * n;");
+    }
+    emit("");
+  }
+
+  void emit_snode_constructor(const SNode &sn) {
+    // TODO(k-ye): handle `pointer`
+    const auto ty = sn.type;
+    const auto &name = sn.node_type_name;
+    if (ty == SNodeType::root) {
+      emit("  {}(device byte *addr) {{", name);
+    } else {
+      emit(
+          "  {}(device byte *addr, device Runtime *rtm, device MemoryAllocator "
+          "*ma) {{",
+          name);
+    }
+    if (ty == SNodeType::bitmasked || ty == SNodeType::dynamic) {
+      emit("    rep_.init(addr, /*meta_offset=*/elem_stride * n);");
+    } else {
+      // `dense` or `root`
+      emit("    rep_.init(addr);");
+    }
+    emit("  }}\n");
+  }
+
+  void emit_snode_get_child_func(SNodeType ty, const std::string &ch_name) {
+    // TODO(k-ye): handle `pointer`
+    emit("  {} children(int i) {{", ch_name);
+    emit("    return {{rep_.addr() + (i * elem_stride)}};");
+    emit("  }}\n");
+  }
+
+  void emit_snode_activation_funcs(SNodeType ty) {
+    emit("  inline bool is_active(int i) {{");
+    emit("    return rep_.is_active(i);");
+    emit("  }}\n");
+    emit("  inline void activate(int i) {{");
+    emit("    rep_.activate(i);");
+    emit("  }}\n");
+    if (ty == SNodeType::dynamic) {
+      emit("  inline void deactivate() {{");
+      emit("    rep_.deactivate();");
+      emit("  }}\n");
+    } else {
+      emit("  inline void deactivate(int i) {{");
+      emit("    rep_.deactivate(i);");
+      emit("  }}\n");
+    }
+  }
+
   void generate_types(const SNode &snode) {
     const bool is_place = snode.is_place();
     if (!is_place) {
+      // Generate {snode}_ch
       const std::string class_name = snode.node_type_name + "_ch";
       emit("class {} {{", class_name);
       emit(" public:");
-      emit("  {}(device byte* a) : addr_(a) {{}}", class_name);
+      emit("  {}(device byte *a) : addr_(a) {{}}", class_name);
 
-      std::string stride_str;
+      std::string stride_str = "0";
       for (int i = 0; i < (int)snode.ch.size(); i++) {
         const auto &ch_node_name = snode.ch[i]->node_type_name;
-        emit("  {} get{}() {{", ch_node_name, i);
-        if (stride_str.empty()) {
-          emit("    return {{addr_}};");
-          stride_str = ch_node_name + "::stride";
-        } else {
-          emit("    return {{addr_ + ({})}};", stride_str);
-          stride_str += " + " + ch_node_name + "::stride";
-        }
+        emit("  {} get{}(device Runtime *rtm, device MemoryAllocator *ma) {{",
+             ch_node_name, i);
+        emit("    return {{addr_ + ({}), rtm, ma}};", stride_str);
+        stride_str += " + " + ch_node_name + "::stride";
         emit("  }}");
         emit("");
       }
-      emit("  device byte* addr() {{ return addr_; }}");
+      emit("  device byte *addr() {{ return addr_; }}");
       emit("");
-      if (stride_str.empty()) {
-        // Is it possible for this to have no children?
-        stride_str = "0";
-      }
+      // Is it possible for this to have no children?
       emit("  constant static constexpr int stride = {};", stride_str);
       emit(" private:");
-      emit("  device byte* addr_;");
+      emit("  device byte *addr_;");
       emit("}};");
     }
     emit("");
@@ -136,43 +195,42 @@ class StructCompiler {
       emit("struct {} {{", node_name);
       emit("  // place");
       emit("  constant static constexpr int stride = sizeof({});", dt_name);
-      emit("  {}(device byte* v) : val((device {}*)v) {{}}", node_name,
-           dt_name);
+      emit("");
+      // `place` constructor
+      emit("  {}(device byte *v, device Runtime *, device MemoryAllocator *)",
+           node_name);
+      emit("    : val((device {}*)v) {{}}", dt_name);
+      emit("");
       emit("  device {}* val;", dt_name);
       emit("}};");
     } else if (snty == SNodeType::dense || snty == SNodeType::root ||
                snty == SNodeType::bitmasked || snty == SNodeType::dynamic) {
       const std::string ch_name = fmt::format("{}_ch", node_name);
       emit("struct {} {{", node_name);
-      emit("  // {}", snode_type_name(snty));
+      const auto snty_name = snode_type_name(snty);
+      emit("  // {}", snty_name);
       const int n = get_n(snode);
       emit("  constant static constexpr int n = {};", n);
-      if (snty == SNodeType::bitmasked) {
-        emit(
-            "  constant static constexpr int stride = {}::stride * n + "
-            "/*bitmasks=*/{};",
-            ch_name, bitmasks_stride(n));
-      } else if (snty == SNodeType::dynamic) {
-        emit(
-            "  constant static constexpr int stride = {}::stride * n + "
-            "/*dynamic=*/{};",
-            ch_name, kAlignment);
-      } else {
-        emit("  constant static constexpr int stride = {}::stride * n;",
-             ch_name);
+      emit_snode_stride(snty, ch_name, n);
+      emit_snode_constructor(snode);
+      emit_snode_get_child_func(snty, ch_name);
+      emit_snode_activation_funcs(snty);
+      if (snty == SNodeType::dynamic) {
+        emit("  inline int append(int32_t data) {{");
+        emit("    return rep_.append(data);");
+        emit("  }}\n");
+        emit("  inline int length() {{");
+        emit("    return rep_.length();");
+        emit("  }}\n");
       }
-      emit("  {}(device byte* a) : addr_(a) {{}}", node_name);
-      emit("");
-      emit("  {} children(int i) {{", ch_name);
-      emit("    return {{addr_ + i * {}::stride}};", ch_name);
-      emit("  }}");
-      emit("");
       emit(" private:");
-      emit("  device byte* addr_;");
+      emit("  SNodeRep_{} rep_;", snty_name);
       emit("}};");
     } else {
-      TI_ERROR("SNodeType={} not supported on Metal", snode_type_name(snty));
-      TI_NOT_IMPLEMENTED;
+      TI_ERROR(
+          "SNodeType={} not supported on Metal.\nConsider using "
+          "ti.init(ti.cpu) if you want to use sparse data structures.",
+          snode_type_name(snode.type));
     }
     emit("");
   }
@@ -213,37 +271,23 @@ class StructCompiler {
     return sn_desc.stride;
   }
 
-  void emit_runtime_structs(const SNode *root) {
+  void emit_runtime_structs() {
     line_appender_.append_raw(shaders::kMetalRuntimeStructsSourceCode);
-    emit("");
-    line_appender_.append_raw(shaders::kMetalRuntimeUtilsSourceCode);
     emit("");
     emit("struct Runtime {{");
     emit("  SNodeMeta snode_metas[{}];", max_snodes_);
     emit("  SNodeExtractors snode_extractors[{}];", max_snodes_);
-    emit("  ListManager snode_lists[{}];", max_snodes_);
+    emit("  ListManagerData snode_lists[{}];", max_snodes_);
     emit("  uint32_t rand_seeds[{}];", kNumRandSeeds);
     emit("}};");
+    line_appender_.append_raw(shaders::kMetalRuntimeUtilsSourceCode);
+    emit("");
   }
 
   size_t compute_runtime_size() {
-    size_t result = (max_snodes_) *
-                    (kSNodeMetaSize + kSNodeExtractorsSize + kListManagerSize);
+    size_t result = (max_snodes_) * (kSNodeMetaSize + kSNodeExtractorsSize +
+                                     kListManagerDataSize);
     result += sizeof(uint32_t) * kNumRandSeeds;
-    TI_DEBUG("Metal sizeof(Runtime): {} bytes", result);
-    if (has_sparse_snode_) {
-      // We only need additional memory to hold sparsity information. Don't
-      // allocate it if there is no sparse SNode at all.
-      int total_items = 0;
-      for (const auto &kv : snode_descriptors_) {
-        total_items += kv.second.total_num_self_from_root(snode_descriptors_);
-      }
-      const size_t list_data_size = total_items * kListgenElementSize;
-      TI_DEBUG("Metal runtime sparse list data size: {} bytes", list_data_size);
-      result += list_data_size;
-    } else {
-      TI_TRACE("Metal runtime doesn't need additional memory for snode_lists");
-    }
     return result;
   }
 
@@ -269,6 +313,10 @@ int SNodeDescriptor::total_num_self_from_root(
   const auto *psn = snode->parent;
   TI_ASSERT(psn != nullptr);
   return sn_descs.find(psn->id)->second.total_num_elems_from_root;
+}
+
+int total_num_self_from_root(const SNodeDescriptorsMap &m, int snode_id) {
+  return m.at(snode_id).total_num_self_from_root(m);
 }
 
 CompiledStructs compile_structs(SNode &root) {

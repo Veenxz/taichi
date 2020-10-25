@@ -1,5 +1,6 @@
 #include "taichi/ir/ir.h"
 #include "taichi/ir/analysis.h"
+#include "taichi/ir/statements.h"
 #include "taichi/ir/transforms.h"
 #include "taichi/ir/visitors.h"
 #include "taichi/program/program.h"
@@ -101,27 +102,41 @@ class IRCloner : public IRVisitor {
   void visit(OffloadedStmt *stmt) override {
     generic_visit(stmt);
     auto other = other_node->as<OffloadedStmt>();
-    if (stmt->has_body()) {
-      TI_ASSERT(stmt->body);
-      TI_ASSERT(other->body);
+
+#define CLONE_BLOCK(B)                    \
+  if (stmt->B) {                          \
+    other->B = std::make_unique<Block>(); \
+    other_node = other->B.get();          \
+    stmt->B->accept(this);                \
+  }
+
+    CLONE_BLOCK(tls_prologue)
+    CLONE_BLOCK(bls_prologue)
+
+    if (stmt->body) {
       other_node = other->body.get();
       stmt->body->accept(this);
-      other_node = other;
     }
+
+    CLONE_BLOCK(bls_epilogue)
+    CLONE_BLOCK(tls_epilogue)
+#undef CLONE_BLOCK
+
+    other_node = other;
   }
 
   static std::unique_ptr<IRNode> run(IRNode *root, Kernel *kernel) {
-    if (kernel == nullptr) {
-      kernel = root->get_kernel();
-    }
     std::unique_ptr<IRNode> new_root = root->clone();
     IRCloner cloner(new_root.get());
     cloner.phase = IRCloner::register_operand_map;
     root->accept(&cloner);
     cloner.phase = IRCloner::replace_operand;
     root->accept(&cloner);
-    irpass::typecheck(new_root.get());
-    irpass::fix_block_parents(new_root.get());
+
+    if (kernel != nullptr) {
+      new_root->kernel = kernel;
+    }
+    irpass::type_check(new_root.get());  // probably unnecessary
     return new_root;
   }
 };

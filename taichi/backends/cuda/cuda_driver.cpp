@@ -36,6 +36,7 @@ CUDADriver::CUDADriver() {
 
 #define PER_CUDA_FUNCTION(name, symbol_name, ...) \
   name.set(loader->load_function(#symbol_name));  \
+  name.set_lock(&lock);                           \
   name.set_names(#name, #symbol_name);
 #include "taichi/backends/cuda/cuda_driver_functions.inc.h"
 #undef PER_CUDA_FUNCTION
@@ -46,7 +47,7 @@ CUDADriver::CUDADriver() {
     TI_TRACE("CUDA driver API (v{}.{}) loaded.", version / 1000,
              version % 1000 / 10);
   } else {
-    TI_DEBUG("CUDA driver not found.");
+    TI_TRACE("CUDA driver not found.");
   }
 }
 

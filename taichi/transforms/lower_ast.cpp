@@ -1,4 +1,5 @@
 #include "taichi/ir/ir.h"
+#include "taichi/ir/statements.h"
 #include "taichi/ir/transforms.h"
 #include "taichi/ir/analysis.h"
 #include "taichi/ir/visitors.h"
@@ -68,7 +69,7 @@ class LowerAST : public IRVisitor {
     auto ident = stmt->ident;
     TI_ASSERT(block->local_var_to_stmt.find(ident) ==
               block->local_var_to_stmt.end());
-    auto lowered = std::make_unique<AllocaStmt>(stmt->ret_type.data_type);
+    auto lowered = std::make_unique<AllocaStmt>(stmt->ret_type);
     block->local_var_to_stmt.insert(std::make_pair(ident, lowered.get()));
     stmt->parent->replace_with(stmt, std::move(lowered));
     throw IRModified();
@@ -80,8 +81,8 @@ class LowerAST : public IRVisitor {
 
     auto new_if = std::make_unique<IfStmt>(stmt->condition->stmt);
 
-    new_if->true_mask = fctx.push_back<AllocaStmt>(DataType::i32);
-    new_if->false_mask = fctx.push_back<AllocaStmt>(DataType::i32);
+    new_if->true_mask = fctx.push_back<AllocaStmt>(PrimitiveType::i32);
+    new_if->false_mask = fctx.push_back<AllocaStmt>(PrimitiveType::i32);
 
     fctx.push_back<LocalStoreStmt>(new_if->true_mask, stmt->condition->stmt);
     auto lnot_stmt_ptr = fctx.push_back<UnaryOpStmt>(UnaryOpType::logic_not,
@@ -89,11 +90,11 @@ class LowerAST : public IRVisitor {
     fctx.push_back<LocalStoreStmt>(new_if->false_mask, lnot_stmt_ptr);
 
     if (stmt->true_statements) {
-      new_if->true_statements = std::move(stmt->true_statements);
+      new_if->set_true_statements(std::move(stmt->true_statements));
       new_if->true_statements->mask_var = new_if->true_mask;
     }
     if (stmt->false_statements) {
-      new_if->false_statements = std::move(stmt->false_statements);
+      new_if->set_false_statements(std::move(stmt->false_statements));
       new_if->false_statements->mask_var = new_if->false_mask;
     }
 
@@ -153,7 +154,7 @@ class LowerAST : public IRVisitor {
     auto cond_stmt = fctx.back_stmt();
 
     auto &&new_while = std::make_unique<WhileStmt>(std::move(stmt->body));
-    auto mask = std::make_unique<AllocaStmt>(DataType::i32);
+    auto mask = std::make_unique<AllocaStmt>(PrimitiveType::i32);
     new_while->mask = mask.get();
     auto &stmts = new_while->body;
     stmts->insert(std::move(fctx.stmts), /*location=*/0);
@@ -161,7 +162,7 @@ class LowerAST : public IRVisitor {
     stmts->insert(
         std::make_unique<WhileControlStmt>(new_while->mask, cond_stmt),
         fctx.stmts.size());
-    stmt->insert_before_me(std::make_unique<AllocaStmt>(DataType::i32));
+    stmt->insert_before_me(std::make_unique<AllocaStmt>(PrimitiveType::i32));
     auto &&const_stmt =
         std::make_unique<ConstStmt>(TypedConstant((int32)0xFFFFFFFF));
     auto const_stmt_ptr = const_stmt.get();
@@ -215,7 +216,7 @@ class LowerAST : public IRVisitor {
       } else {
         // transform into a structure as
         // i = begin; while (1) { if (i >= end) break; original body; i += 1; }
-        fctx.push_back<AllocaStmt>(DataType::i32);
+        fctx.push_back<AllocaStmt>(PrimitiveType::i32);
         auto loop_var = fctx.back_stmt();
         stmt->parent->local_var_to_stmt[stmt->loop_var_id[0]] = loop_var;
         fctx.push_back<LocalStoreStmt>(loop_var, begin->stmt);
@@ -228,7 +229,7 @@ class LowerAST : public IRVisitor {
             BinaryOpType::cmp_lt, loop_var_load_stmt, end->stmt);
 
         auto &&new_while = std::make_unique<WhileStmt>(std::move(stmt->body));
-        auto mask = std::make_unique<AllocaStmt>(DataType::i32);
+        auto mask = std::make_unique<AllocaStmt>(PrimitiveType::i32);
         new_while->mask = mask.get();
         auto &stmts = new_while->body;
         for (int i = 0; i < (int)load_and_compare.size(); i++) {
@@ -250,7 +251,8 @@ class LowerAST : public IRVisitor {
             std::make_unique<WhileControlStmt>(new_while->mask, cond_stmt),
             load_and_compare.size());
 
-        stmt->insert_before_me(std::make_unique<AllocaStmt>(DataType::i32));
+        stmt->insert_before_me(
+            std::make_unique<AllocaStmt>(PrimitiveType::i32));
         auto &&const_stmt =
             std::make_unique<ConstStmt>(TypedConstant((int32)0xFFFFFFFF));
         auto const_stmt_ptr = const_stmt.get();
@@ -281,6 +283,7 @@ class LowerAST : public IRVisitor {
       auto &&new_for = std::make_unique<StructForStmt>(
           snode, std::move(stmt->body), stmt->vectorize, stmt->parallelize,
           stmt->block_dim);
+      new_for->index_offsets = offsets;
       VecStatement new_statements;
       for (int i = 0; i < (int)stmt->loop_var_id.size(); i++) {
         Stmt *loop_index = new_statements.push_back<LoopIndexStmt>(
@@ -320,7 +323,9 @@ class LowerAST : public IRVisitor {
     auto expr = stmt->value;
     auto fctx = make_flatten_ctx();
     expr->flatten(&fctx);
-    fctx.push_back<KernelReturnStmt>(fctx.back_stmt());
+    const auto dt = stmt->element_type();
+    TI_ASSERT(dt != PrimitiveType::unknown);
+    fctx.push_back<KernelReturnStmt>(fctx.back_stmt(), dt);
     stmt->parent->replace_with(stmt, std::move(fctx.stmts));
     throw IRModified();
   }
@@ -330,7 +335,9 @@ class LowerAST : public IRVisitor {
     auto expr = stmt->expr;
     auto fctx = make_flatten_ctx();
     expr->flatten(&fctx);
-    stmt->eval_expr.cast<EvalExpression>()->stmt_ptr = stmt->expr->stmt;
+    if (stmt->eval_expr.expr && stmt->eval_expr.is<EvalExpression>()) {
+      stmt->eval_expr.cast<EvalExpression>()->stmt_ptr = stmt->expr->stmt;
+    }
     stmt->parent->replace_with(stmt, std::move(fctx.stmts));
     throw IRModified();
   }
@@ -377,11 +384,14 @@ class LowerAST : public IRVisitor {
       fctx.push_back<SNodeOpStmt>(stmt->op_type, stmt->snode, ptr, val_stmt);
     } else if (stmt->snode->type == SNodeType::pointer ||
                stmt->snode->type == SNodeType::hash ||
-               stmt->snode->type == SNodeType::dynamic ||
+               stmt->snode->type == SNodeType::dense ||
                stmt->snode->type == SNodeType::bitmasked) {
       TI_ASSERT(SNodeOpStmt::activation_related(stmt->op_type));
       fctx.push_back<SNodeOpStmt>(stmt->op_type, stmt->snode, indices_stmt);
     } else {
+      TI_ERROR("The {} operation is not supported on {} SNode",
+               snode_op_type_name(stmt->op_type),
+               snode_type_name(stmt->snode->type));
       TI_NOT_IMPLEMENTED
     }
 
@@ -393,12 +403,19 @@ class LowerAST : public IRVisitor {
     // expand rhs
     Stmt *val_stmt = nullptr;
     auto fctx = make_flatten_ctx();
-    if (stmt->val.expr) {
-      auto expr = stmt->val;
+    if (stmt->cond.expr) {
+      auto expr = stmt->cond;
       expr->flatten(&fctx);
       val_stmt = expr->stmt;
     }
-    fctx.push_back<AssertStmt>(stmt->text, val_stmt);
+
+    auto &fargs = stmt->args;  // frontend stmt args
+    std::vector<Stmt *> args_stmts(fargs.size());
+    for (int i = 0; i < (int)fargs.size(); ++i) {
+      fargs[i]->flatten(&fctx);
+      args_stmts[i] = fargs[i]->stmt;
+    }
+    fctx.push_back<AssertStmt>(val_stmt, stmt->text, args_stmts);
     stmt->parent->replace_with(stmt, std::move(fctx.stmts));
     throw IRModified();
   }
@@ -420,7 +437,8 @@ class LowerAST : public IRVisitor {
 
 namespace irpass {
 
-void lower(IRNode *root) {
+void lower_ast(IRNode *root) {
+  TI_AUTO_PROF;
   LowerAST::run(root);
 }
 

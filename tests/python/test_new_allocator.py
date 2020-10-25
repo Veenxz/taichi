@@ -5,8 +5,8 @@ import taichi as ti
 def test_1d():
     N = 16
 
-    x = ti.var(ti.f32, shape=(N, ))
-    y = ti.var(ti.f32, shape=(N, ))
+    x = ti.field(ti.f32, shape=(N, ))
+    y = ti.field(ti.f32, shape=(N, ))
 
     @ti.kernel
     def func():
@@ -27,8 +27,8 @@ def test_3d():
     N = 2
     M = 2
 
-    x = ti.var(ti.f32, shape=(N, M))
-    y = ti.var(ti.f32, shape=(N, M))
+    x = ti.field(ti.f32, shape=(N, M))
+    y = ti.field(ti.f32, shape=(N, M))
 
     @ti.kernel
     def func():
@@ -50,7 +50,7 @@ def test_3d():
 def test_matrix():
     N = 16
 
-    x = ti.Matrix(2, 2, dt=ti.f32, shape=(N, ), layout=ti.AOS)
+    x = ti.Matrix.field(2, 2, dtype=ti.f32, shape=(N, ), layout=ti.AOS)
 
     @ti.kernel
     def func():
@@ -69,7 +69,7 @@ def test_matrix():
 @ti.all_archs
 def test_alloc_in_kernel():
     return  # build bots may not have this much memory to tests...
-    x = ti.var(ti.f32)
+    x = ti.field(ti.f32)
 
     ti.root.pointer(ti.i, 8192).dense(ti.i, 1024 * 1024).place(x)
 

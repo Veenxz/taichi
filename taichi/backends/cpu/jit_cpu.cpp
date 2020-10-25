@@ -36,6 +36,7 @@
 #include "taichi/lang_util.h"
 #include "taichi/program/program.h"
 #include "taichi/jit/jit_session.h"
+#include "taichi/util/file_sequence_writer.h"
 
 TLANG_NAMESPACE_BEGIN
 
@@ -44,8 +45,6 @@ using namespace llvm::orc;
 
 class JITSessionCPU;
 
-// Upgrade to LLVM 10: https://github.com/taichi-dev/taichi/issues/655
-#if LLVM_VERSION_MAJOR >= 10
 class JITModuleCPU : public JITModule {
  private:
   JITSessionCPU *session;
@@ -83,11 +82,17 @@ class JITSessionCPU : public JITSession {
                        memory_manager = smgr.get();
                        return smgr;
                      }),
-        compile_layer(ES, object_layer, ConcurrentIRCompiler(std::move(JTMB))),
+        compile_layer(ES,
+                      object_layer,
+                      std::make_unique<ConcurrentIRCompiler>(std::move(JTMB))),
         DL(DL),
         Mangle(ES, this->DL),
         module_counter(0),
         memory_manager(nullptr) {
+    if (JTMB.getTargetTriple().isOSBinFormatCOFF()) {
+      object_layer.setOverrideObjectFlagsWithResponsibilityFlags(true);
+      object_layer.setAutoClaimResponsibilityForObjectSymbols(true);
+    }
   }
 
   ~JITSessionCPU() {
@@ -105,8 +110,9 @@ class JITSessionCPU : public JITSession {
     global_optimize_module_cpu(M);
     std::lock_guard<std::mutex> _(mut);
     auto &dylib = ES.createJITDylib(fmt::format("{}", module_counter));
-    dylib.setGenerator(cantFail(
-        llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(DL)));
+    dylib.addGenerator(
+        cantFail(llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+            DL.getGlobalPrefix())));
     auto *thread_safe_context = get_current_program()
                                     .get_llvm_context(host_arch())
                                     ->get_this_thread_thread_safe_context();
@@ -122,7 +128,11 @@ class JITSessionCPU : public JITSession {
 
   void *lookup(const std::string Name) override {
     std::lock_guard<std::mutex> _(mut);
+#ifdef __APPLE__
     auto symbol = ES.lookup(all_libs, Mangle(Name));
+#else
+    auto symbol = ES.lookup(all_libs, ES.intern(Name));
+#endif
     if (!symbol)
       TI_ERROR("Function \"{}\" not found", Name);
     return (void *)(symbol->getAddress());
@@ -130,7 +140,11 @@ class JITSessionCPU : public JITSession {
 
   void *lookup_in_module(JITDylib *lib, const std::string Name) {
     std::lock_guard<std::mutex> _(mut);
+#ifdef __APPLE__
     auto symbol = ES.lookup({lib}, Mangle(Name));
+#else
+    auto symbol = ES.lookup({lib}, ES.intern(Name));
+#endif
     if (!symbol)
       TI_ERROR("Function \"{}\" not found", Name);
     return (void *)(symbol->getAddress());
@@ -143,114 +157,6 @@ class JITSessionCPU : public JITSession {
 void *JITModuleCPU::lookup_function(const std::string &name) {
   return session->lookup_in_module(dylib, name);
 }
-#else
-class JITModuleCPU : public JITModule {
- private:
-  JITSessionCPU *session;
-  VModuleKey key;
-
- public:
-  JITModuleCPU(JITSessionCPU *session, VModuleKey key)
-      : session(session), key(key) {
-  }
-
-  void *lookup_function(const std::string &name) override;
-
-  bool direct_dispatch() const override {
-    return true;
-  }
-};
-
-class JITSessionCPU : public JITSession {
- private:
-  ExecutionSession ES;
-  std::map<VModuleKey, std::shared_ptr<SymbolResolver> > resolvers;
-  std::unique_ptr<TargetMachine> TM;
-  DataLayout DL;
-  LegacyRTDyldObjectLinkingLayer object_layer;
-  LegacyIRCompileLayer<decltype(object_layer), SimpleCompiler> compile_layer;
-  MangleAndInterner Mangle;
-  std::mutex mut;
-
- public:
-  JITSessionCPU(JITTargetMachineBuilder JTMB, DataLayout DL)
-      : TM(EngineBuilder().selectTarget()),
-        DL(DL),
-        object_layer(ES,
-                     [this](VModuleKey K) {
-                       return LegacyRTDyldObjectLinkingLayer::Resources{
-                           std::make_shared<SectionMemoryManager>(),
-                           resolvers[K]};
-                     }),
-        compile_layer(object_layer, SimpleCompiler(*TM)),
-        Mangle(ES, this->DL) {
-    llvm::sys::DynamicLibrary::LoadLibraryPermanently(nullptr);
-  }
-
-  DataLayout get_data_layout() override {
-    return DL;
-  }
-
-  JITModule *add_module(std::unique_ptr<llvm::Module> M) override {
-    TI_ASSERT(M);
-    global_optimize_module_cpu(M);
-    std::lock_guard<std::mutex> _(mut);
-    // Create a new VModuleKey.
-    VModuleKey K = ES.allocateVModule();
-
-    // Build a resolver and associate it with the new key.
-    resolvers[K] = createLegacyLookupResolver(
-        ES,
-        [this](const std::string &Name) -> JITSymbol {
-          if (auto Sym = object_layer.findSymbol(Name, false))
-            return Sym;
-          else if (auto Err = Sym.takeError())
-            return std::move(Err);
-          if (auto SymAddr =
-                  RTDyldMemoryManager::getSymbolAddressInProcess(Name))
-            return JITSymbol(SymAddr, JITSymbolFlags::Exported);
-          return nullptr;
-        },
-        [](Error Err) { cantFail(std::move(Err), "lookupFlags failed"); });
-
-    // Add the module to the JIT with the new key.
-    cantFail(compile_layer.addModule(K, std::move(M)));
-    auto new_module = std::make_unique<JITModuleCPU>(this, K);
-    auto new_module_raw_ptr = new_module.get();
-    modules.push_back(std::move(new_module));
-    return new_module_raw_ptr;
-  }
-
-  void *lookup(const std::string Name) override {
-    std::lock_guard<std::mutex> _(mut);
-    auto mangled = *Mangle(Name);
-    auto symbol = object_layer.findSymbol(
-        mangled, false);  // On Windows the last argument must be False
-    if (!symbol)
-      TI_ERROR("Function \"{}\" (mangled=\"{}\") not found", Name,
-               std ::string(mangled));
-    return (void *)(llvm::cantFail(symbol.getAddress()));
-  }
-
-  void *lookup_in_module(VModuleKey key, const std::string Name) {
-    std::lock_guard<std::mutex> _(mut);
-    auto mangled = *Mangle(Name);
-    auto symbol = compile_layer.findSymbolIn(
-        key, mangled, false);  // On Windows the last argument must be False
-    if (!symbol)
-      TI_ERROR("Function \"{}\" (mangled=\"{}\") not found", Name,
-               std ::string(mangled));
-    return (void *)(llvm::cantFail(symbol.getAddress()));
-  }
-
- private:
-  static void global_optimize_module_cpu(std::unique_ptr<llvm::Module> &module);
-};
-
-void *JITModuleCPU::lookup_function(const std::string &name) {
-  return session->lookup_in_module(key, name);
-}
-#endif
 
 void JITSessionCPU::global_optimize_module_cpu(
     std::unique_ptr<llvm::Module> &module) {
@@ -333,15 +239,14 @@ void JITSessionCPU::global_optimize_module_cpu(
   }
 
   if (get_current_program().config.print_kernel_llvm_ir_optimized) {
-    TI_INFO("Functions with > 100 instructions in optimized LLVM IR:");
-    static int counter = 0;
-    std::error_code ec;
-    auto fn = fmt::format("taichi_optimized_{:04d}.ll", counter);
-    llvm::raw_fd_ostream fdos(fn, ec);
-    module->print(fdos, nullptr);
-    TaichiLLVMContext::print_huge_functions(module.get());
-    TI_INFO("Optimized LLVM IR emitted to file {}", fn);
-    counter++;
+    if (false) {
+      TI_INFO("Functions with > 100 instructions in optimized LLVM IR:");
+      TaichiLLVMContext::print_huge_functions(module.get());
+    }
+    static FileSequenceWriter writer(
+        "taichi_kernel_cpu_llvm_ir_optimized_{:04d}.ll",
+        "optimized LLVM IR (CPU)");
+    writer.write(module.get());
   }
 }
 

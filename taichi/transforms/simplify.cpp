@@ -1,7 +1,10 @@
 #include "taichi/ir/ir.h"
+#include "taichi/ir/statements.h"
 #include "taichi/ir/transforms.h"
 #include "taichi/ir/analysis.h"
 #include "taichi/ir/visitors.h"
+#include "taichi/program/kernel.h"
+#include "taichi/program/program.h"
 #include <set>
 #include <unordered_set>
 #include <utility>
@@ -29,7 +32,6 @@ class BasicBlockSimplify : public IRVisitor {
         kernel(kernel) {
     allow_undefined_visitor = true;
     invoke_default_visitor = false;
-    current_struct_for = nullptr;
     run();
   }
 
@@ -46,107 +48,6 @@ class BasicBlockSimplify : public IRVisitor {
       current_stmt_id = i;
       block->statements[i]->accept(this);
     }
-  }
-
-  void visit(Stmt *stmt) override {
-    if (stmt->is_container_statement())
-      return;
-    else {
-      TI_ERROR("Visitor for non-container stmt undefined.");
-    }
-  }
-
-  void visit(GlobalPtrStmt *stmt) override {
-    if (is_done(stmt))
-      return;
-    for (int i = 0; i < current_stmt_id; i++) {
-      auto &bstmt = block->statements[i];
-      // A previous GlobalPtrStmt in the basic block
-      if (stmt->ret_type == bstmt->ret_type) {
-        auto &bstmt_data = *bstmt;
-        if (typeid(bstmt_data) == typeid(*stmt)) {
-          auto bstmt_ = bstmt->as<GlobalPtrStmt>();
-          bool same = true;
-          for (int l = 0; l < stmt->width(); l++) {
-            if (stmt->snodes[l] != bstmt_->snodes[l]) {
-              same = false;
-              break;
-            }
-          }
-          if (stmt->indices.size() != bstmt_->indices.size()) {
-            same = false;
-          } else {
-            for (int j = 0; j < (int)stmt->indices.size(); j++) {
-              if (stmt->indices[j] != bstmt_->indices[j])
-                same = false;
-            }
-          }
-          if (same) {
-            if (bstmt_->activate == stmt->activate || bstmt_->activate) {
-              stmt->replace_with(bstmt.get());
-              stmt->parent->erase(current_stmt_id);
-              throw IRModified();
-            } else {
-              // bstmt->active == false && stmt->active == true
-              // do nothing.
-            }
-          }
-        }
-      }
-    }
-    set_done(stmt);
-  }
-
-  void visit(ArgLoadStmt *stmt) override {
-    if (is_done(stmt))
-      return;
-    for (int i = 0; i < current_stmt_id; i++) {
-      auto &bstmt = block->statements[i];
-      auto &bstmt_data = *bstmt;
-      if (typeid(bstmt_data) == typeid(*stmt)) {
-        if (stmt->width() == bstmt->width()) {
-          auto bstmt_ = bstmt->as<ArgLoadStmt>();
-          bool same = stmt->arg_id == bstmt_->arg_id;
-          if (same) {
-            stmt->replace_with(bstmt.get());
-            stmt->parent->erase(current_stmt_id);
-            throw IRModified();
-          }
-        }
-      }
-    }
-    set_done(stmt);
-  }
-
-  void visit(ConstStmt *stmt) override {
-    if (is_done(stmt))
-      return;
-    for (int i = 0; i < current_stmt_id; i++) {
-      auto &bstmt = block->statements[i];
-      auto &bstmt_data = *bstmt;
-      if (typeid(bstmt_data) == typeid(*stmt)) {
-        if (stmt->width() == bstmt->width()) {
-          auto bstmt_ = bstmt->as<ConstStmt>();
-          bool same = true;
-          for (int l = 0; l < stmt->width(); l++) {
-            if (!stmt->val[l].equal_type_and_value(bstmt_->val[l])) {
-              same = false;
-              break;
-            }
-          }
-          if (same) {
-            stmt->replace_with(bstmt.get());
-            stmt->parent->erase(current_stmt_id);
-            throw IRModified();
-          }
-        }
-      }
-    }
-    set_done(stmt);
-  }
-
-  void visit(AllocaStmt *stmt) override {
-    return;
   }
 
   void visit(ElementShuffleStmt *stmt) override {
@@ -171,316 +72,6 @@ class BasicBlockSimplify : public IRVisitor {
       }
     }
 
-    // weaken indexing
-    // TODO: StructForStmt::loop_vars is deprecated
-    /*if (current_struct_for && stmt->width() == 1) {
-      auto &loop_vars = current_struct_for->loop_vars;
-      for (int k = 0; k < (int)loop_vars.size(); k++) {
-        auto diff = irpass::analysis::value_diff(
-            stmt->elements[0].stmt, stmt->elements[0].index,
-            current_struct_for->loop_vars[k]);
-        if (diff.linear_related() && diff.certain()) {
-          auto load = stmt->insert_before_me(
-              Stmt::make<LocalLoadStmt>(LocalAddress(loop_vars[k], 0)));
-          load->ret_type.data_type = DataType::i32;
-          auto constant = stmt->insert_before_me(
-              Stmt::make<ConstStmt>(TypedConstant(diff.low)));
-          constant->ret_type.data_type = DataType::i32;
-          auto add = stmt->insert_before_me(
-              Stmt::make<BinaryOpStmt>(BinaryOpType::add, load, constant));
-          add->ret_type.data_type = DataType::i32;
-          stmt->replace_with(add);
-          stmt->parent->erase(stmt);
-          throw IRModified();
-        }
-      }
-    }*/
-
-    // find dup
-    for (int i = 0; i < current_stmt_id; i++) {
-      auto &bstmt = block->statements[i];
-      if (stmt->ret_type == bstmt->ret_type) {
-        auto &bstmt_data = *bstmt;
-        if (typeid(bstmt_data) == typeid(*stmt)) {
-          auto bstmt_ = bstmt->as<ElementShuffleStmt>();
-          bool same = true;
-          for (int l = 0; l < stmt->width(); l++) {
-            if (stmt->elements[l].stmt != bstmt_->elements[l].stmt ||
-                stmt->elements[l].index != bstmt_->elements[l].index) {
-              same = false;
-              break;
-            }
-          }
-          if (same) {
-            stmt->replace_with(bstmt.get());
-            stmt->parent->erase(stmt);
-            throw IRModified();
-          }
-        }
-      }
-    }
-    set_done(stmt);
-  }
-
-  // Local variable operation optimizations:
-  // 1. Store forwarding
-  //
-
-  bool modifies_local(Stmt *stmt, std::vector<Stmt *> vars) {
-    if (stmt->is<LocalStoreStmt>()) {
-      auto st = stmt->as<LocalStoreStmt>();
-      for (auto var : vars) {
-        if (st->ptr == var) {
-          return true;
-        }
-      }
-    } else if (stmt->is<AtomicOpStmt>()) {
-      auto st = stmt->as<AtomicOpStmt>();
-      for (auto var : vars) {
-        if (st->dest == var) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  void visit(LocalLoadStmt *stmt) override {
-    if (is_done(stmt))
-      return;
-
-    // Merge identical loads
-    for (int i = 0; i < current_stmt_id; i++) {
-      auto &bstmt = block->statements[i];
-      if (stmt->ret_type == bstmt->ret_type) {
-        auto &bstmt_data = *bstmt;
-        if (typeid(bstmt_data) == typeid(*stmt)) {
-          auto bstmt_ = bstmt->as<LocalLoadStmt>();
-          bool same = true;
-          std::vector<Stmt *> vars;
-          for (int l = 0; l < stmt->width(); l++) {
-            vars.push_back(stmt->ptr[l].var);
-            if (stmt->ptr[l].var != bstmt_->ptr[l].var ||
-                stmt->ptr[l].offset != bstmt_->ptr[l].offset) {
-              same = false;
-              break;
-            }
-          }
-          if (same) {
-            // no store to the var?
-            bool has_related_store = false;
-            for (int j = i + 1; j < current_stmt_id; j++) {
-              if (!advanced_optimization) {
-                if (block->statements[j]
-                        ->is_container_statement()) {  // no if, while, etc..
-                  has_related_store = true;
-                  break;
-                }
-                if (modifies_local(block->statements[j].get(), vars)) {
-                  has_related_store = true;
-                }
-                continue;
-              }
-              if (irpass::analysis::has_store_or_atomic(
-                      block->statements[j].get(), vars)) {
-                has_related_store = true;
-                break;
-              }
-            }
-            if (!has_related_store) {
-              stmt->replace_with(bstmt.get());
-              stmt->parent->erase(current_stmt_id);
-              throw IRModified();
-            }
-          }
-        }
-      }
-    }
-
-    // store-forwarding
-    bool regular = true;
-    auto alloca = stmt->ptr[0].var;
-    for (int l = 0; l < stmt->width(); l++) {
-      if (stmt->ptr[l].offset != l || stmt->ptr[l].var != alloca) {
-        regular = false;
-      }
-    }
-    if (regular) {
-      // Check all previous statements in the current block before the local
-      // load
-      Stmt *containing_statement = stmt;
-      auto stmt_id = block->locate(containing_statement);
-      TI_ASSERT(stmt_id != -1);
-      for (int i = stmt_id - 1; i >= 0; i--) {
-        if (!advanced_optimization) {
-          auto &bstmt = block->statements[i];
-          // Find a previous store
-          if (auto s = bstmt->cast<AtomicOpStmt>()) {
-            if (s->dest == alloca) {
-              break;
-            }
-          }
-          if (bstmt->is<LocalStoreStmt>()) {
-            auto bstmt_ = bstmt->as<LocalStoreStmt>();
-            // Same alloca
-            if (bstmt_->ptr == alloca) {
-              // Forward to the first local store only
-              stmt->replace_with(bstmt_->data);
-              stmt->parent->erase(current_stmt_id);
-              throw IRModified();
-            }
-          } else if (bstmt->is_container_statement()) {
-            // assume this container may modify the local var
-            break;
-          }
-          continue;
-        }
-        auto last_store = irpass::analysis::last_store_or_atomic(
-            block->statements[i].get(), alloca);
-        if (!last_store.first) {
-          // invalid
-          break;
-        }
-        auto bstmt = last_store.second;
-        if (bstmt != nullptr) {
-          if (bstmt->is<LocalStoreStmt>()) {
-            // Forward to the first local store only
-            stmt->replace_with(bstmt->as<LocalStoreStmt>()->data);
-            stmt->parent->erase(current_stmt_id);
-            throw IRModified();
-          } else {
-            TI_ASSERT(bstmt->is<AllocaStmt>());
-            auto zero = stmt->insert_after_me(Stmt::make<ConstStmt>(
-                LaneAttribute<TypedConstant>(bstmt->ret_type.data_type)));
-            zero->repeat(stmt->width());
-            stmt->replace_with(zero);
-            stmt->parent->erase(current_stmt_id);
-            throw IRModified();
-          }
-        }
-      }
-      // Note: simply checking all statements before stmt is not sufficient
-      // since statements after stmt may change the value of the alloca
-      // For example, in a loop, later part of the loop body may alter the local
-      // var value.
-    }
-    set_done(stmt);
-  }
-
-  void visit(LocalStoreStmt *stmt) override {
-    if (is_done(stmt))
-      return;
-
-    // has previous store?
-    for (int i = 0; i < current_stmt_id; i++) {
-      auto &bstmt = block->statements[i];
-      if (stmt->ret_type == bstmt->ret_type) {
-        auto &bstmt_data = *bstmt;
-        if (typeid(bstmt_data) == typeid(*stmt)) {
-          auto bstmt_ = bstmt->as<LocalStoreStmt>();
-          bool same = stmt->ptr == bstmt_->ptr;
-          if (same) {
-            bool has_load = false;
-            for (int j = i + 1; j < current_stmt_id; j++) {
-              if (!advanced_optimization) {
-                if (block->statements[j]
-                        ->is_container_statement()) {  // no if, while, etc..
-                  has_load = true;
-                  break;
-                }
-                if (block->statements[j]->is<LocalLoadStmt>() &&
-                    block->statements[j]->as<LocalLoadStmt>()->has_source(
-                        stmt->ptr)) {
-                  has_load = true;
-                }
-                if (block->statements[j]->is<AtomicOpStmt>() &&
-                    (block->statements[j]->as<AtomicOpStmt>()->dest ==
-                     stmt->ptr)) {
-                  // $a = alloca
-                  // $b : local store [$a <- v1]  <-- prev lstore |bstmt_|
-                  // $c = atomic add($a, v2)      <-- cannot eliminate $b
-                  // $d : local store [$a <- v3]
-                  has_load = true;
-                }
-                continue;
-              }
-              if (!irpass::analysis::gather_statements(
-                       block->statements[j].get(),
-                       [&](Stmt *s) {
-                         if (auto load = s->cast<LocalLoadStmt>())
-                           return load->has_source(stmt->ptr);
-                         else if (auto atomic = s->cast<AtomicOpStmt>())
-                           return atomic->dest == stmt->ptr;
-                         else
-                           return s->is<ContinueStmt>() ||
-                                  s->is<WhileControlStmt>();
-                       })
-                       .empty()) {
-                has_load = true;
-                break;
-              }
-            }
-            if (!has_load) {
-              stmt->parent->erase(bstmt_);
-              throw IRModified();
-            }
-          }
-        }
-      }
-    }
-
-    // Does it have a following load? If not, delete.
-    if (stmt->parent->locate(stmt->ptr) != -1) {
-      // optimize variables local to this block only
-      bool has_related = false;
-      for (int i = current_stmt_id + 1; i < (int)block->statements.size();
-           i++) {
-        if (!advanced_optimization) {
-          auto &bstmt = block->statements[i];
-          if (bstmt->is_container_statement()) {
-            has_related = true;
-            break;
-          }
-          if (bstmt->is<LocalLoadStmt>()) {
-            auto bstmt_ = bstmt->as<LocalLoadStmt>();
-            if (bstmt_->has_source(stmt->ptr)) {
-              has_related = true;
-              break;
-            }
-          }
-          if (bstmt->is<AtomicOpStmt>()) {
-            // $a = alloca
-            // $b : local store [$a <- v1]
-            // $c = atomic add($a, v2)      <-- cannot eliminate $b
-            auto bstmt_ = bstmt->as<AtomicOpStmt>();
-            if (bstmt_->dest == stmt->ptr) {
-              has_related = true;
-              break;
-            }
-          }
-          continue;
-        }
-        if (!irpass::analysis::gather_statements(
-                 block->statements[i].get(),
-                 [&](Stmt *s) {
-                   if (auto load = s->cast<LocalLoadStmt>())
-                     return load->has_source(stmt->ptr);
-                   else if (auto atomic = s->cast<AtomicOpStmt>())
-                     return atomic->dest == stmt->ptr;
-                   else
-                     return false;
-                 })
-                 .empty()) {
-          has_related = true;
-          break;
-        }
-      }
-      if (!has_related) {
-        stmt->parent->erase(stmt);
-        throw IRModified();
-      }
-    }
-
     set_done(stmt);
   }
 
@@ -497,6 +88,8 @@ class BasicBlockSimplify : public IRVisitor {
           if (same) {
             // no store to the var?
             bool has_store = false;
+            auto advanced_optimization =
+                block->get_config().advanced_optimization;
             for (int j = i + 1; j < current_stmt_id; j++) {
               if (!advanced_optimization) {
                 if (block->statements[j]
@@ -513,9 +106,11 @@ class BasicBlockSimplify : public IRVisitor {
                        block->statements[j].get(),
                        [&](Stmt *s) {
                          if (auto store = s->cast<GlobalStoreStmt>())
-                           return maybe_same_address(store->ptr, stmt->ptr);
+                           return irpass::analysis::maybe_same_address(
+                               store->ptr, stmt->ptr);
                          else if (auto atomic = s->cast<AtomicOpStmt>())
-                           return maybe_same_address(atomic->dest, stmt->ptr);
+                           return irpass::analysis::maybe_same_address(
+                               atomic->dest, stmt->ptr);
                          else
                            return false;
                        })
@@ -536,147 +131,49 @@ class BasicBlockSimplify : public IRVisitor {
     set_done(stmt);
   }
 
-  void visit(GlobalStoreStmt *stmt) override {
-    // do nothing for global mem ops
-  }
-
-  void visit(SNodeOpStmt *stmt) override {
-    return;
-  }
-
   void visit(IntegerOffsetStmt *stmt) override {
-    if (is_done(stmt))
-      return;
     if (stmt->offset == 0) {
       stmt->replace_with(stmt->input);
       stmt->parent->erase(stmt);
       throw IRModified();
     }
-
-    for (int i = 0; i < current_stmt_id; i++) {
-      auto &bstmt = block->statements[i];
-      if (stmt->ret_type == bstmt->ret_type) {
-        auto &bstmt_data = *bstmt;
-        if (typeid(bstmt_data) == typeid(*stmt)) {
-          auto bstmt_ = bstmt->as<IntegerOffsetStmt>();
-          if (bstmt_->input == stmt->input && bstmt_->offset == stmt->offset) {
-            stmt->replace_with(bstmt.get());
-            stmt->parent->erase(current_stmt_id);
-            throw IRModified();
-          }
-        }
-      }
-    }
-    set_done(stmt);
   }
 
-  void visit(GetRootStmt *stmt) override {
+  void visit(BitExtractStmt *stmt) override {
     if (is_done(stmt))
       return;
-    for (int i = 0; i < current_stmt_id; i++) {
-      auto &bstmt = block->statements[i];
-      if (bstmt->is<GetRootStmt>()) {
-        stmt->replace_with(bstmt.get());
+
+    // step 0: eliminate empty extraction
+    if (stmt->bit_begin == stmt->bit_end) {
+      auto zero = Stmt::make<ConstStmt>(LaneAttribute<TypedConstant>(0));
+      stmt->replace_with(zero.get());
+      stmt->insert_after_me(std::move(zero));
+      stmt->parent->erase(current_stmt_id);
+      throw IRModified();
+    }
+
+    // step 1: eliminate useless extraction of another BitExtractStmt
+    if (stmt->bit_begin == 0 && stmt->input->is<BitExtractStmt>()) {
+      auto bstmt = stmt->input->as<BitExtractStmt>();
+      if (stmt->bit_end >= bstmt->bit_end - bstmt->bit_begin) {
+        stmt->replace_with(bstmt);
         stmt->parent->erase(current_stmt_id);
         throw IRModified();
       }
     }
-    set_done(stmt);
-  }
 
-  void visit(UnaryOpStmt *stmt) override {
-    if (is_done(stmt))
-      return;
-    if (stmt->is_cast()) {
-      if (stmt->cast_type == stmt->operand->ret_type.data_type) {
-        stmt->replace_with(stmt->operand);
+    // step 2: eliminate useless extraction of a LoopIndexStmt
+    if (stmt->bit_begin == 0 && stmt->input->is<LoopIndexStmt>()) {
+      auto bstmt = stmt->input->as<LoopIndexStmt>();
+      const int max_num_bits = bstmt->max_num_bits();
+      if (max_num_bits != -1 && stmt->bit_end >= max_num_bits) {
+        stmt->replace_with(bstmt);
         stmt->parent->erase(current_stmt_id);
-        set_done(stmt);
-        return;
+        throw IRModified();
       }
     }
-    for (int i = 0; i < current_stmt_id; i++) {
-      auto &bstmt = block->statements[i];
-      if (stmt->ret_type == bstmt->ret_type) {
-        auto &bstmt_data = *bstmt;
-        if (typeid(bstmt_data) == typeid(*stmt)) {
-          auto bstmt_ = bstmt->as<UnaryOpStmt>();
-          if (bstmt_->same_operation(stmt) &&
-              bstmt_->operand == stmt->operand) {
-            stmt->replace_with(bstmt.get());
-            stmt->parent->erase(current_stmt_id);
-            throw IRModified();
-          }
-        }
-      }
-    }
-    set_done(stmt);
-  }
 
-  void visit(BinaryOpStmt *stmt) override {
-    if (is_done(stmt))
-      return;
-    if ((stmt->op_type == BinaryOpType::add ||
-         stmt->op_type == BinaryOpType::sub) &&
-        stmt->ret_type.data_type == DataType::i32) {
-      if (stmt->rhs->is<ConstStmt>()) {
-        auto stmt_ = stmt->rhs->as<ConstStmt>();
-        bool all_zero = true;
-        for (int l = 0; l < stmt_->width(); l++) {
-          if (stmt_->val[l].val_int32() != 0) {
-            all_zero = false;
-          }
-        }
-        if (all_zero) {
-          stmt->replace_with(stmt->lhs);
-          stmt->parent->erase(current_stmt_id);
-          throw IRModified();
-        }
-      }
-    }
-    for (int i = 0; i < current_stmt_id; i++) {
-      auto &bstmt = block->statements[i];
-      if (stmt->ret_type == bstmt->ret_type) {
-        auto &bstmt_data = *bstmt;
-        if (typeid(bstmt_data) == typeid(*stmt)) {
-          auto bstmt_ = bstmt->as<BinaryOpStmt>();
-          if (bstmt_->op_type == stmt->op_type && bstmt_->lhs == stmt->lhs &&
-              bstmt_->rhs == stmt->rhs) {
-            stmt->replace_with(bstmt.get());
-            stmt->parent->erase(current_stmt_id);
-            throw IRModified();
-          }
-        }
-      }
-    }
-    set_done(stmt);
-  }
-
-  void visit(TernaryOpStmt *stmt) override {
-    if (is_done(stmt))
-      return;
-    for (int i = 0; i < current_stmt_id; i++) {
-      auto &bstmt = block->statements[i];
-      if (stmt->ret_type == bstmt->ret_type) {
-        auto &bstmt_data = *bstmt;
-        if (typeid(bstmt_data) == typeid(*stmt)) {
-          auto bstmt_ = bstmt->as<TernaryOpStmt>();
-          if (bstmt_->op_type == stmt->op_type && bstmt_->op1 == stmt->op1 &&
-              bstmt_->op2 == stmt->op2 && bstmt_->op3 == stmt->op3) {
-            stmt->replace_with(bstmt.get());
-            stmt->parent->erase(current_stmt_id);
-            throw IRModified();
-          }
-        }
-      }
-    }
-    set_done(stmt);
-  }
-
-  void visit(OffsetAndExtractBitsStmt *stmt) override {
-    if (is_done(stmt))
-      return;
-    // step 1: try weakening when a struct for is used
+    // step 3: try weakening when a struct for is used
     if (current_struct_for && !stmt->simplified) {
       const int num_loop_vars = current_struct_for->snode->num_active_indices;
       for (int k = 0; k < num_loop_vars; k++) {
@@ -687,7 +184,7 @@ class BasicBlockSimplify : public IRVisitor {
           if (k == num_loop_vars - 1) {
             auto load = stmt->insert_before_me(
                 Stmt::make<LoopIndexStmt>(current_struct_for, k));
-            load->ret_type.data_type = DataType::i32;
+            load->ret_type = PrimitiveType::i32;
             stmt->input = load;
             int64 bound = 1LL << stmt->bit_end;
             auto offset = (((int64)diff.low % bound + bound) % bound) &
@@ -704,20 +201,26 @@ class BasicBlockSimplify : public IRVisitor {
               stmt->replace_with(offset_stmt);
               // fix the offset stmt operand
               offset_stmt->as<IntegerOffsetStmt>()->input = stmt;
-              stmt->offset = 0;
             } else {
-              stmt->offset = offset;
+              if (offset != 0) {
+                auto offset_const = stmt->insert_before_me(
+                    Stmt::make<ConstStmt>(LaneAttribute<TypedConstant>(
+                        TypedConstant(PrimitiveType::i32, offset))));
+                auto sum = stmt->insert_before_me(Stmt::make<BinaryOpStmt>(
+                    BinaryOpType::add, load, offset_const));
+                stmt->input = sum;
+              }
             }
           } else {
             // insert constant
             auto load = stmt->insert_before_me(
                 Stmt::make<LoopIndexStmt>(current_struct_for, k));
-            load->ret_type.data_type = DataType::i32;
+            load->ret_type = PrimitiveType::i32;
             auto constant = stmt->insert_before_me(
                 Stmt::make<ConstStmt>(TypedConstant(diff.low)));
             auto add = stmt->insert_before_me(
                 Stmt::make<BinaryOpStmt>(BinaryOpType::add, load, constant));
-            add->ret_type.data_type = DataType::i32;
+            add->ret_type = PrimitiveType::i32;
             stmt->input = add;
           }
           stmt->simplified = true;
@@ -726,37 +229,6 @@ class BasicBlockSimplify : public IRVisitor {
       }
     }
 
-    // step 2: eliminate useless extraction of another OffsetAndExtractBitsStmt
-    if (advanced_optimization) {
-      if (stmt->offset == 0 && stmt->bit_begin == 0 &&
-          stmt->input->is<OffsetAndExtractBitsStmt>()) {
-        auto bstmt = stmt->input->as<OffsetAndExtractBitsStmt>();
-        if (stmt->bit_end == bstmt->bit_end - bstmt->bit_begin) {
-          stmt->replace_with(bstmt);
-          stmt->parent->erase(current_stmt_id);
-          throw IRModified();
-        }
-      }
-    }
-
-    // step 3: eliminate dup
-    for (int i = 0; i < current_stmt_id; i++) {
-      auto &bstmt = block->statements[i];
-      if (stmt->ret_type == bstmt->ret_type) {
-        auto &bstmt_data = *bstmt;
-        if (typeid(bstmt_data) == typeid(*stmt)) {
-          auto bstmt_ = bstmt->as<OffsetAndExtractBitsStmt>();
-          if (bstmt_->input == stmt->input &&
-              bstmt_->bit_begin == stmt->bit_begin &&
-              bstmt_->bit_end == stmt->bit_end &&
-              bstmt_->offset == stmt->offset) {
-            stmt->replace_with(bstmt.get());
-            stmt->parent->erase(current_stmt_id);
-            throw IRModified();
-          }
-        }
-      }
-    }
     set_done(stmt);
   }
 
@@ -807,7 +279,7 @@ class BasicBlockSimplify : public IRVisitor {
     stmt->insert_before_me(std::move(sum));
     stmt->parent->erase(stmt);
     // get types of adds and muls
-    irpass::typecheck(stmt->parent);
+    irpass::type_check(stmt->parent);
     throw IRModified();
   }
 
@@ -823,8 +295,8 @@ class BasicBlockSimplify : public IRVisitor {
       // compute offset...
       for (int i = 0; i < (int)snode->ch.size(); i++) {
         TI_ASSERT(snode->ch[i]->type == SNodeType::place);
-        TI_ASSERT(snode->ch[i]->dt == DataType::i32 ||
-                  snode->ch[i]->dt == DataType::f32);
+        TI_ASSERT(snode->ch[i]->dt->is_primitive(PrimitiveTypeID::i32) ||
+                  snode->ch[i]->dt->is_primitive(PrimitiveTypeID::f32));
       }
 
       auto offset_stmt = stmt->insert_after_me(Stmt::make<IntegerOffsetStmt>(
@@ -836,27 +308,6 @@ class BasicBlockSimplify : public IRVisitor {
       throw IRModified();
     }
 
-    for (int i = 0; i < current_stmt_id; i++) {
-      auto &bstmt = block->statements[i];
-      if (stmt->ret_type == bstmt->ret_type) {
-        auto &bstmt_data = *bstmt;
-        if (typeid(bstmt_data) == typeid(*stmt)) {
-          auto bstmt_ = bstmt->as<SNodeLookupStmt>();
-          if (bstmt_->snode == stmt->snode &&
-              bstmt_->input_snode == stmt->input_snode &&
-              bstmt_->input_index == stmt->input_index &&
-              // identical_vectors(bstmt_->global_indices,
-              // stmt->global_indices)
-              // && no need for the above line. As long as input_index are the
-              // same global indices comparison can be omitted
-              bstmt_->activate == stmt->activate) {
-            stmt->replace_with(bstmt.get());
-            stmt->parent->erase(current_stmt_id);
-            throw IRModified();
-          }
-        }
-      }
-    }
     set_done(stmt);
   }
 
@@ -880,35 +331,7 @@ class BasicBlockSimplify : public IRVisitor {
       throw IRModified();
     }
 
-    for (int i = 0; i < current_stmt_id; i++) {
-      auto &bstmt = block->statements[i];
-      if (stmt->ret_type == bstmt->ret_type) {
-        auto &bstmt_data = *bstmt;
-        if (typeid(bstmt_data) == typeid(*stmt)) {
-          auto bstmt_ = bstmt->as<GetChStmt>();
-          if (bstmt_->input_ptr == stmt->input_ptr &&
-              bstmt_->input_snode == stmt->input_snode &&
-              bstmt_->chid == stmt->chid) {
-            stmt->replace_with(bstmt.get());
-            stmt->parent->erase(current_stmt_id);
-            throw IRModified();
-          }
-        }
-      }
-    }
     set_done(stmt);
-  }
-
-  void visit(AtomicOpStmt *stmt) override {
-    return;
-  }
-
-  void visit(PrintStmt *stmt) override {
-    return;
-  }
-
-  void visit(RandStmt *stmt) override {
-    return;
   }
 
   void visit(WhileControlStmt *stmt) override {
@@ -916,10 +339,6 @@ class BasicBlockSimplify : public IRVisitor {
       stmt->mask = nullptr;
       throw IRModified();
     }
-  }
-
-  void visit(ContinueStmt *stmt) override {
-    return;
   }
 
   static bool is_global_write(Stmt *stmt) {
@@ -1020,25 +439,27 @@ class BasicBlockSimplify : public IRVisitor {
       return false;
     };
 
-    if (if_stmt->true_statements &&
-        flatten(if_stmt->true_statements->statements, true)) {
-      throw IRModified();
-    }
-    if (if_stmt->false_statements &&
-        flatten(if_stmt->false_statements->statements, false)) {
-      throw IRModified();
+    if (kernel->program.config.flatten_if) {
+      if (if_stmt->true_statements &&
+          flatten(if_stmt->true_statements->statements, true)) {
+        throw IRModified();
+      }
+      if (if_stmt->false_statements &&
+          flatten(if_stmt->false_statements->statements, false)) {
+        throw IRModified();
+      }
     }
 
     if (if_stmt->true_statements) {
       if (if_stmt->true_statements->statements.empty()) {
-        if_stmt->true_statements = nullptr;
+        if_stmt->set_true_statements(nullptr);
         throw IRModified();
       }
     }
 
     if (if_stmt->false_statements) {
       if (if_stmt->false_statements->statements.empty()) {
-        if_stmt->false_statements = nullptr;
+        if_stmt->set_false_statements(nullptr);
         throw IRModified();
       }
     }
@@ -1048,7 +469,7 @@ class BasicBlockSimplify : public IRVisitor {
       throw IRModified();
     }
 
-    if (advanced_optimization) {
+    if (block->get_config().advanced_optimization) {
       // Merge adjacent if's with the identical condition.
       // TODO: What about IfStmt::true_mask and IfStmt::false_mask?
       if (current_stmt_id > 0 &&
@@ -1073,10 +494,6 @@ class BasicBlockSimplify : public IRVisitor {
     }
   }
 
-  void visit(RangeAssumptionStmt *stmt) override {
-    return;
-  }
-
   void visit(OffloadedStmt *stmt) override {
     if (stmt->has_body() && stmt->body->statements.empty()) {
       stmt->parent->erase(stmt);
@@ -1099,6 +516,9 @@ class Simplify : public IRVisitor {
   Kernel *kernel;
 
   Simplify(IRNode *node, Kernel *kernel) : kernel(kernel) {
+    if (!kernel)
+      this->kernel = node->get_kernel();
+    TI_ASSERT(this->kernel);
     modified = false;
     allow_undefined_visitor = true;
     invoke_default_visitor = true;
@@ -1134,7 +554,9 @@ class Simplify : public IRVisitor {
   }
 
   void visit(StructForStmt *for_stmt) override {
-    TI_ASSERT(current_struct_for == nullptr);
+    TI_ASSERT_INFO(current_struct_for == nullptr,
+                   "Nested struct-fors are not supported for now. "
+                   "Please try to use range-fors for inner loops.");
     current_struct_for = for_stmt;
     for_stmt->body->accept(this);
     current_struct_for = nullptr;
@@ -1145,28 +567,62 @@ class Simplify : public IRVisitor {
   }
 
   void visit(OffloadedStmt *stmt) override {
-    if (stmt->body)
-      stmt->body->accept(this);
+    stmt->all_blocks_accept(this);
   }
 };
 
 namespace irpass {
 
-void simplify(IRNode *root, Kernel *kernel) {
-  while (1) {
+bool simplify(IRNode *root, Kernel *kernel) {
+  TI_AUTO_PROF;
+  bool modified = false;
+  while (true) {
     Simplify pass(root, kernel);
-    if (!pass.modified)
+    if (pass.modified)
+      modified = true;
+    else
       break;
   }
+  return modified;
 }
 
-void full_simplify(IRNode *root, Kernel *kernel) {
-  constant_fold(root);
-  if (advanced_optimization) {
-    alg_simp(root);
-    die(root);
-    whole_kernel_cse(root);
+void full_simplify(IRNode *root, bool after_lower_access, Kernel *kernel) {
+  TI_AUTO_PROF;
+  if (root->get_config().advanced_optimization) {
+    bool first_iteration = true;
+    while (true) {
+      bool modified = false;
+      extract_constant(root);
+      if (unreachable_code_elimination(root))
+        modified = true;
+      if (binary_op_simplify(root))
+        modified = true;
+      if (constant_fold(root))
+        modified = true;
+      if (die(root))
+        modified = true;
+      if (alg_simp(root))
+        modified = true;
+      if (die(root))
+        modified = true;
+      if (simplify(root, kernel))
+        modified = true;
+      if (die(root))
+        modified = true;
+      // Don't do these time-consuming optimization passes again if the IR is
+      // not modified.
+      if ((first_iteration || modified) && whole_kernel_cse(root))
+        modified = true;
+      if ((first_iteration || modified) &&
+          cfg_optimization(root, after_lower_access))
+        modified = true;
+      first_iteration = false;
+      if (!modified)
+        break;
+    }
+    return;
   }
+  constant_fold(root);
   die(root);
   simplify(root, kernel);
   die(root);

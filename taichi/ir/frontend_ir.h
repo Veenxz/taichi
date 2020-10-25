@@ -16,7 +16,7 @@ class FrontendAllocaStmt : public Stmt {
   Identifier ident;
 
   FrontendAllocaStmt(const Identifier &lhs, DataType type) : ident(lhs) {
-    ret_type = VectorType(1, type);
+    ret_type = TypeFactory::create_vector_or_scalar_type(1, type);
   }
 
   TI_DEFINE_ACCEPT
@@ -40,10 +40,20 @@ class FrontendSNodeOpStmt : public Stmt {
 class FrontendAssertStmt : public Stmt {
  public:
   std::string text;
-  Expr val;
+  Expr cond;
+  std::vector<Expr> args;
 
-  FrontendAssertStmt(const std::string &text, const Expr &val)
-      : text(text), val(val) {
+  FrontendAssertStmt(const Expr &cond, const std::string &text)
+      : text(text), cond(cond) {
+  }
+
+  FrontendAssertStmt(const Expr &cond,
+                     const std::string &text,
+                     const std::vector<Expr> &args_)
+      : text(text), cond(cond) {
+    for (auto &a : args_) {
+      args.push_back(load_if_ptr(a));
+    }
   }
 
   TI_DEFINE_ACCEPT
@@ -90,6 +100,9 @@ class FrontendPrintStmt : public Stmt {
   TI_DEFINE_ACCEPT
 };
 
+// This statement evaluates the expression.
+// The expression should have side effects otherwise the expression will do
+// nothing.
 class FrontendEvalStmt : public Stmt {
  public:
   Expr expr;
@@ -189,7 +202,8 @@ class FrontendKernelReturnStmt : public Stmt {
  public:
   Expr value;
 
-  FrontendKernelReturnStmt(const Expr &value) : value(value) {
+  FrontendKernelReturnStmt(const Expr &value, DataType dt) : value(value) {
+    ret_type = TypeFactory::create_vector_or_scalar_type(1, dt);
   }
 
   bool is_container_statement() const override {
@@ -204,19 +218,16 @@ class FrontendKernelReturnStmt : public Stmt {
 class ArgLoadExpression : public Expression {
  public:
   int arg_id;
+  DataType dt;
 
-  ArgLoadExpression(int arg_id) : arg_id(arg_id) {
+  ArgLoadExpression(int arg_id, DataType dt) : arg_id(arg_id), dt(dt) {
   }
 
   std::string serialize() override {
-    return fmt::format("arg[{}]", arg_id);
+    return fmt::format("arg[{}] (dt={})", arg_id, data_type_name(dt));
   }
 
-  void flatten(FlattenContext *ctx) override {
-    auto ran = std::make_unique<ArgLoadStmt>(arg_id);
-    ctx->push_back(std::move(ran));
-    stmt = ctx->back_stmt();
-  }
+  void flatten(FlattenContext *ctx) override;
 };
 
 class RandExpression : public Expression {
@@ -230,11 +241,7 @@ class RandExpression : public Expression {
     return fmt::format("rand<{}>()", data_type_name(dt));
   }
 
-  void flatten(FlattenContext *ctx) override {
-    auto ran = std::make_unique<RandStmt>(dt);
-    ctx->push_back(std::move(ran));
-    stmt = ctx->back_stmt();
-  }
+  void flatten(FlattenContext *ctx) override;
 };
 
 class UnaryOpExpression : public Expression {
@@ -245,7 +252,7 @@ class UnaryOpExpression : public Expression {
 
   UnaryOpExpression(UnaryOpType type, const Expr &operand)
       : type(type), operand(smart_load(operand)) {
-    cast_type = DataType::unknown;
+    cast_type = PrimitiveType::unknown;
   }
 
   bool is_cast() const;
@@ -271,15 +278,7 @@ class BinaryOpExpression : public Expression {
                        binary_op_type_symbol(type), rhs->serialize());
   }
 
-  void flatten(FlattenContext *ctx) override {
-    // if (stmt)
-    //  return;
-    lhs->flatten(ctx);
-    rhs->flatten(ctx);
-    ctx->push_back(std::make_unique<BinaryOpStmt>(type, lhs->stmt, rhs->stmt));
-    ctx->stmts.back()->tb = tb;
-    stmt = ctx->back_stmt();
-  }
+  void flatten(FlattenContext *ctx) override;
 };
 
 class TernaryOpExpression : public Expression {
@@ -302,16 +301,44 @@ class TernaryOpExpression : public Expression {
                        op1->serialize(), op2->serialize(), op3->serialize());
   }
 
-  void flatten(FlattenContext *ctx) override {
-    // if (stmt)
-    //  return;
-    op1->flatten(ctx);
-    op2->flatten(ctx);
-    op3->flatten(ctx);
-    ctx->push_back(
-        std::make_unique<TernaryOpStmt>(type, op1->stmt, op2->stmt, op3->stmt));
-    stmt = ctx->back_stmt();
+  void flatten(FlattenContext *ctx) override;
+};
+
+class ExternalFuncCallExpression : public Expression {
+ public:
+  void *func;
+  std::string source;
+  std::vector<Expr> args;
+  std::vector<Expr> outputs;
+
+  ExternalFuncCallExpression(void *func,
+                             std::string const &source,
+                             const std::vector<Expr> &args,
+                             const std::vector<Expr> &outputs)
+      : func(func), source(source), args(args), outputs(outputs) {
   }
+
+  std::string serialize() override {
+    std::string io = "inputs=";
+
+    for (auto &s : args) {
+      io += s.serialize();
+    }
+
+    io += ", outputs=";
+
+    for (auto &s : outputs) {
+      io += s.serialize();
+    }
+
+    if (func) {
+      return fmt::format("call {:x} ({})", (uint64)func, io);
+    } else {
+      return fmt::format("asm \"{}\" ({})", source, io);
+    }
+  }
+
+  void flatten(FlattenContext *ctx) override;
 };
 
 class ExternalTensorExpression : public Expression {
@@ -329,11 +356,7 @@ class ExternalTensorExpression : public Expression {
     return fmt::format("{}d_ext_arr", dim);
   }
 
-  void flatten(FlattenContext *ctx) override {
-    auto ptr = Stmt::make<ArgLoadStmt>(arg_id, true);
-    ctx->push_back(std::move(ptr));
-    stmt = ctx->back_stmt();
-  }
+  void flatten(FlattenContext *ctx) override;
 };
 
 class GlobalVariableExpression : public Expression {
@@ -368,12 +391,7 @@ class GlobalVariableExpression : public Expression {
     return "#" + ident.name();
   }
 
-  void flatten(FlattenContext *ctx) override {
-    TI_ASSERT(snode->num_active_indices == 0);
-    auto ptr = Stmt::make<GlobalPtrStmt>(LaneAttribute<SNode *>(snode),
-                                         std::vector<Stmt *>());
-    ctx->push_back(std::move(ptr));
-  }
+  void flatten(FlattenContext *ctx) override;
 };
 
 class GlobalPtrExpression : public Expression {
@@ -429,13 +447,21 @@ class RangeAssumptionExpression : public Expression {
                        base.serialize(), high);
   }
 
-  void flatten(FlattenContext *ctx) override {
-    input->flatten(ctx);
-    base->flatten(ctx);
-    ctx->push_back(
-        Stmt::make<RangeAssumptionStmt>(input->stmt, base->stmt, low, high));
-    stmt = ctx->back_stmt();
+  void flatten(FlattenContext *ctx) override;
+};
+
+class LoopUniqueExpression : public Expression {
+ public:
+  Expr input;
+
+  LoopUniqueExpression(const Expr &input) : input(input) {
   }
+
+  std::string serialize() override {
+    return fmt::format("loop_unique({})", input.serialize());
+  }
+
+  void flatten(FlattenContext *ctx) override;
 };
 
 class IdExpression : public Expression {
@@ -450,17 +476,10 @@ class IdExpression : public Expression {
     return id.name();
   }
 
-  void flatten(FlattenContext *ctx) override {
-    auto var_stmt = ctx->current_block->lookup_var(id);
-    if (var_stmt->is<AllocaStmt>()) {
-      ctx->push_back(
-          std::make_unique<LocalLoadStmt>(LocalAddress(var_stmt, 0)));
-      stmt = ctx->back_stmt();
-    } else {
-      // The loop index may have a coordinate offset.
-      TI_ASSERT(var_stmt->is<LoopIndexStmt>() || var_stmt->is<BinaryOpStmt>());
-      stmt = var_stmt;
-    }
+  void flatten(FlattenContext *ctx) override;
+
+  Stmt *flatten_noload(FlattenContext *ctx) {
+    return ctx->current_block->lookup_var(id);
   }
 
   bool is_lvalue() const override {
@@ -516,11 +535,7 @@ class GlobalLoadExpression : public Expression {
     return "gbl load " + ptr.serialize();
   }
 
-  void flatten(FlattenContext *ctx) override {
-    ptr->flatten(ctx);
-    ctx->push_back(std::make_unique<GlobalLoadStmt>(ptr->stmt));
-    stmt = ctx->back_stmt();
-  }
+  void flatten(FlattenContext *ctx) override;
 };
 
 class ConstExpression : public Expression {
@@ -535,10 +550,24 @@ class ConstExpression : public Expression {
     return val.stringify();
   }
 
-  void flatten(FlattenContext *ctx) override {
-    ctx->push_back(Stmt::make<ConstStmt>(val));
-    stmt = ctx->back_stmt();
+  void flatten(FlattenContext *ctx) override;
+};
+
+class ExternalTensorShapeAlongAxisExpression : public Expression {
+ public:
+  Expr ptr;
+  int axis;
+
+  std::string serialize() override {
+    return fmt::format("external_tensor_shape_along_axis({}, {})",
+                       ptr->serialize(), axis);
   }
+
+  ExternalTensorShapeAlongAxisExpression(const Expr &ptr, int axis)
+      : ptr(ptr), axis(axis) {
+  }
+
+  void flatten(FlattenContext *ctx) override;
 };
 
 TLANG_NAMESPACE_END

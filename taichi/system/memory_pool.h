@@ -2,7 +2,7 @@
 #include "taichi/common/core.h"
 #include "taichi/system/unified_allocator.h"
 #define TI_RUNTIME_HOST
-#include "taichi/runtime/llvm/context.h"
+#include "taichi/runtime/llvm/mem_request.h"
 
 #include <mutex>
 #include <vector>
@@ -29,6 +29,7 @@ class MemoryPool {
   Program *prog;
 
   MemRequestQueue *queue;
+  void *cuda_stream{nullptr};
 
   MemoryPool(Program *prog);
 
@@ -47,6 +48,9 @@ class MemoryPool {
   void terminate();
 
   ~MemoryPool();
+
+ private:
+  static constexpr bool use_cuda_stream = false;
 };
 
 TLANG_NAMESPACE_END

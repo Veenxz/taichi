@@ -1,11 +1,11 @@
 import taichi as ti
 from math import tau
 from renderer_utils import reflect, refract
-ti.init()
+ti.init(arch=ti.opengl)
 
 N = 512
-img = ti.var(dt=ti.f32, shape=(N, N))
-light_pos = ti.Vector(2, dt=ti.f32, shape=())
+img = ti.field(dtype=ti.f32, shape=(N, N))
+light_pos = ti.Vector.field(2, dtype=ti.f32, shape=())
 
 
 @ti.func
@@ -132,7 +132,10 @@ def sample(p):
 def render():
     for i, j in img:
         o = ti.Vector([i / N, j / N])
-        img[i, j] += sample(o)
+        c = 0.0
+        for k in range(10):
+            c += sample(o)
+        img[i, j] += c / 10
 
 
 gui = ti.GUI('SDF 2D')

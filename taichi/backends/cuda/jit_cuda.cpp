@@ -18,13 +18,17 @@
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h"
 
-#include "taichi/backends/cuda/cuda_driver.h"
 #include "taichi/backends/cuda/cuda_context.h"
-#include "taichi/program/program.h"
-#include "taichi/runtime/llvm/context.h"
-#include "taichi/system/timer.h"
-#include "taichi/lang_util.h"
+#include "taichi/backends/cuda/cuda_driver.h"
 #include "taichi/jit/jit_session.h"
+#include "taichi/lang_util.h"
+#include "taichi/program/program.h"
+#include "taichi/system/timer.h"
+#include "taichi/util/file_sequence_writer.h"
+
+#define TI_RUNTIME_HOST
+#include "taichi/program/context.h"
+#undef TI_RUNTIME_HOST
 
 TLANG_NAMESPACE_BEGIN
 
@@ -41,26 +45,32 @@ class JITModuleCUDA : public JITModule {
     // TODO: figure out why using the guard leads to wrong tests results
     // auto context_guard = CUDAContext::get_instance().get_guard();
     CUDAContext::get_instance().make_current();
-    void *func;
+    void *func = nullptr;
     auto t = Time::get_time();
-    CUDADriver::get_instance().module_get_function(&func, module, name.c_str());
+    auto err = CUDADriver::get_instance().module_get_function.call_with_warning(
+        &func, module, name.c_str());
+    if (err) {
+      TI_ERROR("Cannot look up function {}", name);
+    }
     t = Time::get_time() - t;
-    TI_TRACE("Kernel {} compilation time: {}ms", name, t * 1000);
+    TI_TRACE("CUDA module_get_function {} costs {} ms", name, t * 1000);
+    TI_ASSERT(func != nullptr);
     return func;
   }
 
   void call(const std::string &name,
             const std::vector<void *> &arg_pointers) override {
-    launch(name, 1, 1, arg_pointers);
+    launch(name, 1, 1, 0, arg_pointers);
   }
 
   virtual void launch(const std::string &name,
                       std::size_t grid_dim,
                       std::size_t block_dim,
+                      std::size_t shared_mem_bytes,
                       const std::vector<void *> &arg_pointers) override {
     auto func = lookup_function(name);
     CUDAContext::get_instance().launch(func, name, arg_pointers, grid_dim,
-                                       block_dim);
+                                       block_dim, shared_mem_bytes);
   }
 
   bool direct_dispatch() const override {
@@ -78,6 +88,11 @@ class JITSessionCUDA : public JITSession {
 
   virtual JITModule *add_module(std::unique_ptr<llvm::Module> M) override {
     auto ptx = compile_module_to_ptx(M);
+    if (get_current_program().config.print_kernel_nvptx) {
+      static FileSequenceWriter writer("taichi_kernel_nvptx_{:04d}.ptx",
+                                       "module NVPTX");
+      writer.write(ptx);
+    }
     // TODO: figure out why using the guard leads to wrong tests results
     // auto context_guard = CUDAContext::get_instance().get_guard();
     CUDAContext::get_instance().make_current();
@@ -105,7 +120,7 @@ class JITSessionCUDA : public JITSession {
 };
 
 std::string cuda_mattrs() {
-  return "+ptx50";
+  return "+ptx63";
 }
 
 std::string convert(std::string new_name) {
@@ -132,17 +147,20 @@ std::string convert(std::string new_name) {
 
 std::string JITSessionCUDA::compile_module_to_ptx(
     std::unique_ptr<llvm::Module> &module) {
+  TI_AUTO_PROF
   // Part of this function is borrowed from Halide::CodeGen_PTX_Dev.cpp
-  // TODO: enabling this leads to LLVM error "comdat global value has private
-  // linkage"
-  /*
   if (llvm::verifyModule(*module, &llvm::errs())) {
     module->print(llvm::errs(), nullptr);
-    TI_ERROR("Module broken");
+    TI_WARN("Module broken");
   }
-  */
 
   using namespace llvm;
+
+  if (get_current_program().config.print_kernel_llvm_ir) {
+    static FileSequenceWriter writer("taichi_kernel_cuda_llvm_ir_{:04d}.ll",
+                                     "unoptimized LLVM IR (CUDA)");
+    writer.write(module.get());
+  }
 
   for (auto &f : module->globals())
     f.setName(convert(f.getName()));
@@ -247,18 +265,30 @@ std::string JITSessionCUDA::compile_module_to_ptx(
 
   // Ask the target to add backend passes as necessary.
   bool fail = target_machine->addPassesToEmitFile(
-      module_pass_manager, ostream, nullptr, TargetMachine::CGFT_AssemblyFile,
-      true);
+      module_pass_manager, ostream, nullptr, llvm::CGFT_AssemblyFile, true);
 
   TI_ERROR_IF(fail, "Failed to set up passes to emit PTX source\n");
 
-  // Run optimization passes
-  function_pass_manager.doInitialization();
-  for (llvm::Module::iterator i = module->begin(); i != module->end(); i++) {
-    function_pass_manager.run(*i);
+  {
+    TI_PROFILER("llvm_function_pass");
+    function_pass_manager.doInitialization();
+    for (llvm::Module::iterator i = module->begin(); i != module->end(); i++)
+      function_pass_manager.run(*i);
+
+    function_pass_manager.doFinalization();
   }
-  function_pass_manager.doFinalization();
-  module_pass_manager.run(*module);
+
+  {
+    TI_PROFILER("llvm_module_pass");
+    module_pass_manager.run(*module);
+  }
+
+  if (get_current_program().config.print_kernel_llvm_ir_optimized) {
+    static FileSequenceWriter writer(
+        "taichi_kernel_cuda_llvm_ir_optimized_{:04d}.ll",
+        "optimized LLVM IR (CUDA)");
+    writer.write(module.get());
+  }
 
   std::string buffer(outstr.begin(), outstr.end());
 

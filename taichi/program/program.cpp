@@ -2,13 +2,14 @@
 
 #include "program.h"
 
-#include "taichi/common/task.h"
+#include "taichi/ir/statements.h"
+#include "taichi/program/extension.h"
 #include "taichi/backends/metal/api.h"
 #include "taichi/backends/opengl/opengl_api.h"
 #if defined(TI_WITH_CUDA)
 #include "taichi/backends/cuda/cuda_driver.h"
 #include "taichi/backends/cuda/codegen_cuda.h"
-#include "taichi/backends/cuda/cuda_driver.h"
+#include "taichi/backends/cuda/cuda_context.h"
 #endif
 #include "taichi/backends/metal/codegen_metal.h"
 #include "taichi/backends/opengl/codegen_opengl.h"
@@ -22,6 +23,13 @@
 #include "taichi/ir/frontend_ir.h"
 #include "taichi/program/async_engine.h"
 #include "taichi/util/statistics.h"
+#include "taichi/util/str.h"
+#if defined(TI_WITH_CC)
+#include "taichi/backends/cc/struct_cc.h"
+#include "taichi/backends/cc/cc_layout.h"
+#include "taichi/backends/cc/codegen_cc.h"
+#else
+#endif
 
 TI_NAMESPACE_BEGIN
 
@@ -30,6 +38,8 @@ bool is_cuda_api_available();
 TI_NAMESPACE_END
 
 TLANG_NAMESPACE_BEGIN
+
+namespace {
 
 void assert_failed_host(const char *msg) {
   TI_ERROR("Assertion failure: {}", msg);
@@ -40,6 +50,13 @@ void *taichi_allocate_aligned(Program *prog,
                               std::size_t alignment) {
   return prog->memory_pool->allocate(size, alignment);
 }
+
+inline uint64 *allocate_result_buffer_default(Program *prog) {
+  return (uint64 *)taichi_allocate_aligned(
+      prog, sizeof(uint64) * taichi_result_buffer_entries, 8);
+}
+
+}  // namespace
 
 Program *current_program = nullptr;
 std::atomic<int> Program::num_instances;
@@ -78,6 +95,15 @@ Program::Program(Arch desired_arch) {
     }
   }
 
+  if (arch == Arch::cc) {
+#ifdef TI_WITH_CC
+    cc_program = std::make_unique<cccp::CCProgram>(this);
+#else
+    TI_WARN("No C backend detected.");
+    arch = host_arch();
+#endif
+  }
+
   if (arch != desired_arch) {
     TI_WARN("Falling back to {}", arch_name(arch));
   }
@@ -98,9 +124,18 @@ Program::Program(Arch desired_arch) {
 
   preallocated_device_buffer = nullptr;
 
-  if (config.enable_profiler && runtime) {
+  if (config.kernel_profiler && runtime) {
     runtime->set_profiler(profiler.get());
   }
+#if defined(TI_WITH_CUDA)
+  if (config.arch == Arch::cuda) {
+    if (config.kernel_profiler) {
+      CUDAContext::get_instance().set_profiler(profiler.get());
+    } else {
+      CUDAContext::get_instance().set_profiler(nullptr);
+    }
+  }
+#endif
 
   result_buffer = nullptr;
   current_kernel = nullptr;
@@ -108,24 +143,51 @@ Program::Program(Arch desired_arch) {
   llvm_runtime = nullptr;
   finalized = false;
   snode_root = std::make_unique<SNode>(0, SNodeType::root);
+  snode_root->is_path_all_dense = true;
 
-  if (config.async) {
+  if (config.async_mode) {
     TI_WARN("Running in async mode. This is experimental.");
-    TI_ASSERT(arch_is_cpu(config.arch));
-    async_engine = std::make_unique<AsyncEngine>();
+    TI_ASSERT(is_extension_supported(config.arch, Extension::async_mode));
+    async_engine = std::make_unique<AsyncEngine>(
+        this, [this](Kernel &kernel, OffloadedStmt *offloaded) {
+          return this->compile_to_backend_executable(kernel, offloaded);
+        });
   }
 
   // TODO: allow users to run in debug mode without out-of-bound checks
   if (config.debug)
     config.check_out_of_bound = true;
 
-  if (!arch_is_cpu(config.arch)) {
+  if (!is_extension_supported(config.arch, Extension::assertion)) {
     if (config.check_out_of_bound) {
-      TI_WARN(
-          "Out-of-bound access checking is only implemented on CPUs backends "
-          "for now.");
+      TI_WARN("Out-of-bound access checking is not supported on arch={}",
+              arch_name(config.arch));
       config.check_out_of_bound = false;
     }
+  }
+
+  if (arch == Arch::cuda) {
+#if defined(TI_WITH_CUDA)
+    int num_SMs;
+    CUDADriver::get_instance().device_get_attribute(
+        &num_SMs, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, nullptr);
+    int query_max_block_dim;
+    CUDADriver::get_instance().device_get_attribute(
+        &query_max_block_dim, CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X, nullptr);
+
+    if (config.max_block_dim == 0) {
+      config.max_block_dim = query_max_block_dim;
+    }
+
+    if (config.saturating_grid_dim == 0) {
+      // each SM can have 16-32 resident blocks
+      config.saturating_grid_dim = num_SMs * 32;
+    }
+#endif
+  }
+
+  if (arch_is_cpu(arch)) {
+    config.max_block_dim = 1024;
   }
 
   stat.clear();
@@ -134,28 +196,49 @@ Program::Program(Arch desired_arch) {
            arch_name(arch));
 }
 
+TypeFactory &Program::get_type_factory() {
+  TI_WARN(
+      "Program::get_type_factory() will be deprecated, Please use "
+      "TypeFactory::get_instance()");
+  return TypeFactory::get_instance();
+}
+
 FunctionType Program::compile(Kernel &kernel) {
   auto start_t = Time::get_time();
   TI_AUTO_PROF;
   FunctionType ret = nullptr;
-  if (arch_is_cpu(kernel.arch) || kernel.arch == Arch::cuda) {
+  if (arch_is_cpu(kernel.arch) || kernel.arch == Arch::cuda ||
+      kernel.arch == Arch::metal) {
     kernel.lower();
-    auto codegen = KernelCodeGen::create(kernel.arch, &kernel);
-    ret = codegen->compile();
-  } else if (kernel.arch == Arch::metal) {
-    metal::CodeGen codegen(&kernel, metal_kernel_mgr_.get(),
-                           &metal_compiled_structs_.value());
-    ret = codegen.compile();
+    ret = compile_to_backend_executable(kernel, /*offloaded=*/nullptr);
   } else if (kernel.arch == Arch::opengl) {
     opengl::OpenglCodeGen codegen(kernel.name, &opengl_struct_compiled_.value(),
                                   opengl_kernel_launcher_.get());
     ret = codegen.compile(*this, kernel);
+#ifdef TI_WITH_CC
+  } else if (kernel.arch == Arch::cc) {
+    ret = cccp::compile_kernel(&kernel);
+#endif
   } else {
     TI_NOT_IMPLEMENTED;
   }
   TI_ASSERT(ret);
   total_compilation_time += Time::get_time() - start_t;
   return ret;
+}
+
+FunctionType Program::compile_to_backend_executable(Kernel &kernel,
+                                                    OffloadedStmt *offloaded) {
+  if (arch_is_cpu(kernel.arch) || kernel.arch == Arch::cuda) {
+    auto codegen = KernelCodeGen::create(kernel.arch, &kernel, offloaded);
+    return codegen->compile();
+  } else if (kernel.arch == Arch::metal) {
+    return metal::compile_to_metal_executable(&kernel, metal_kernel_mgr_.get(),
+                                              &metal_compiled_structs_.value(),
+                                              offloaded);
+  }
+  TI_NOT_IMPLEMENTED;
+  return nullptr;
 }
 
 // For CPU and CUDA archs only
@@ -168,7 +251,7 @@ void Program::initialize_runtime_system(StructCompiler *scomp) {
   if (config.arch == Arch::cuda && !config.use_unified_memory) {
 #if defined(TI_WITH_CUDA)
     CUDADriver::get_instance().malloc(
-        &result_buffer, sizeof(uint64) * taichi_result_buffer_entries);
+        (void **)&result_buffer, sizeof(uint64) * taichi_result_buffer_entries);
     auto total_mem = runtime->get_total_memory();
     if (config.device_memory_fraction == 0) {
       TI_ASSERT(config.device_memory_GB > 0);
@@ -190,8 +273,7 @@ void Program::initialize_runtime_system(StructCompiler *scomp) {
     TI_NOT_IMPLEMENTED
 #endif
   } else {
-    result_buffer = (uint64 *)taichi_allocate_aligned(
-        this, sizeof(uint64) * taichi_result_buffer_entries, 8);
+    result_buffer = allocate_result_buffer_default(this);
     tlctx = llvm_context_host.get();
   }
   auto runtime = tlctx->runtime_jit_module;
@@ -201,12 +283,26 @@ void Program::initialize_runtime_system(StructCompiler *scomp) {
   auto snodes = scomp->snodes;
   int root_id = snode_root->id;
 
-  TI_TRACE("Allocating data structure of size {} B", scomp->root_size);
+  // A buffer of random states, one per CUDA thread
+  int num_rand_states = 0;
 
-  runtime->call<void *, void *, std::size_t, std::size_t, void *, void *,
+  if (config.arch == Arch::cuda) {
+#if defined(TI_WITH_CUDA)
+    // It is important to make sure that every CUDA thread has its own random
+    // state so that we do not need expensive per-state locks.
+    num_rand_states = config.saturating_grid_dim * config.max_block_dim;
+#else
+    TI_NOT_IMPLEMENTED
+#endif
+  }
+
+  TI_TRACE("Allocating data structure of size {} B", scomp->root_size);
+  TI_TRACE("Allocating {} random states (used by CUDA only)", num_rand_states);
+
+  runtime->call<void *, void *, std::size_t, std::size_t, void *, int, void *,
                 void *, void *>("runtime_initialize", result_buffer, this,
                                 (std::size_t)scomp->root_size, prealloc_size,
-                                preallocated_device_buffer,
+                                preallocated_device_buffer, num_rand_states,
                                 (void *)&taichi_allocate_aligned,
                                 (void *)std::printf, (void *)std::vsnprintf);
 
@@ -244,7 +340,7 @@ void Program::initialize_runtime_system(StructCompiler *scomp) {
           "runtime_NodeAllocator_initialize", rt, i, node_size);
       TI_TRACE("Allocating ambient element for snode {} (node size {})",
                snodes[i]->id, node_size);
-      runtime->call<void *, int>("runtime_allocate_ambient", rt, i);
+      runtime->call<void *, int>("runtime_allocate_ambient", rt, i, node_size);
     }
   }
 
@@ -255,14 +351,16 @@ void Program::initialize_runtime_system(StructCompiler *scomp) {
 
     runtime->call<void *, void *>("LLVMRuntime_set_assert_failed", llvm_runtime,
                                   (void *)assert_failed_host);
-    // Profiler functions can only be called on host kernels
+  }
+  if (arch_is_cpu(config.arch)) {
+    // Profiler functions can only be called on CPU kernels
     runtime->call<void *, void *>("LLVMRuntime_set_profiler", llvm_runtime,
                                   profiler.get());
     runtime->call<void *, void *>("LLVMRuntime_set_profiler_start",
                                   llvm_runtime,
-                                  (void *)&ProfilerBase::profiler_start);
+                                  (void *)&KernelProfilerBase::profiler_start);
     runtime->call<void *, void *>("LLVMRuntime_set_profiler_stop", llvm_runtime,
-                                  (void *)&ProfilerBase::profiler_stop);
+                                  (void *)&KernelProfilerBase::profiler_stop);
   }
 }
 
@@ -271,6 +369,10 @@ void Program::materialize_layout() {
   std::unique_ptr<StructCompiler> scomp =
       StructCompiler::make(this, host_arch());
   scomp->run(*snode_root, true);
+
+  for (auto snode : scomp->snodes) {
+    snodes[snode->id] = snode;
+  }
 
   if (arch_is_cpu(config.arch)) {
     initialize_runtime_system(scomp.get());
@@ -288,38 +390,77 @@ void Program::materialize_layout() {
                    "Metal arch requires that LLVM being enabled");
     metal_compiled_structs_ = metal::compile_structs(*snode_root);
     if (metal_kernel_mgr_ == nullptr) {
+      TI_ASSERT(result_buffer == nullptr);
+      result_buffer = allocate_result_buffer_default(this);
+
       metal::KernelManager::Params params;
       params.compiled_structs = metal_compiled_structs_.value();
       params.config = &config;
       params.mem_pool = memory_pool.get();
+      params.host_result_buffer = result_buffer;
       params.profiler = profiler.get();
       params.root_id = snode_root->id;
       metal_kernel_mgr_ =
           std::make_unique<metal::KernelManager>(std::move(params));
     }
   } else if (config.arch == Arch::opengl) {
+    TI_ASSERT(result_buffer == nullptr);
+    result_buffer = allocate_result_buffer_default(this);
     opengl::OpenglStructCompiler scomp;
     opengl_struct_compiled_ = scomp.run(*snode_root);
     TI_TRACE("OpenGL root buffer size: {} B",
              opengl_struct_compiled_->root_size);
     opengl_kernel_launcher_ = std::make_unique<opengl::GLSLLauncher>(
         opengl_struct_compiled_->root_size);
+    opengl_kernel_launcher_->result_buffer = result_buffer;
+#ifdef TI_WITH_CC
+  } else if (config.arch == Arch::cc) {
+    TI_ASSERT(result_buffer == nullptr);
+    result_buffer = allocate_result_buffer_default(this);
+    cc_program->compile_layout(snode_root.get());
+#endif
   }
 }
 
 void Program::check_runtime_error() {
-  TI_ASSERT(arch_is_cpu(config.arch));
   synchronize();
   auto tlctx = llvm_context_host.get();
-  auto runtime_jit_module = tlctx->runtime_jit_module;
-  runtime_jit_module->call<void *>("runtime_retrieve_error_code", llvm_runtime);
+  if (llvm_context_device) {
+    // In case there is a standalone device context (e.g. CUDA without unified
+    // memory), use the device context instead.
+    tlctx = llvm_context_device.get();
+  }
+  auto *runtime_jit_module = tlctx->runtime_jit_module;
+  runtime_jit_module->call<void *>("runtime_retrieve_and_reset_error_code",
+                                   llvm_runtime);
   auto error_code = fetch_result<int64>(taichi_result_buffer_error_id);
+
   if (error_code) {
-    runtime_jit_module->call<void *>("runtime_retrieve_error_message",
-                                     llvm_runtime);
-    auto error_message = fetch_result<char *>(taichi_result_buffer_error_id);
+    std::string error_message_template;
+
+    // Here we fetch the error_message_template char by char.
+    // This is not efficient, but fortunately we only need to do this when an
+    // assertion fails. Note that we may not have unified memory here, so using
+    // "fetch_result" that works across device/host memroy is necessary.
+    for (int i = 0;; i++) {
+      runtime_jit_module->call<void *>("runtime_retrieve_error_message",
+                                       llvm_runtime, i);
+      auto c = fetch_result<char>(taichi_result_buffer_error_id);
+      error_message_template += c;
+      if (c == '\0') {
+        break;
+      }
+    }
+
     if (error_code == 1) {
-      TI_ERROR("Assertion failure: {}", error_message);
+      const auto error_message_formatted = format_error_message(
+          error_message_template, [runtime_jit_module, this](int argument_id) {
+            runtime_jit_module->call<void *>(
+                "runtime_retrieve_error_message_argument", llvm_runtime,
+                argument_id);
+            return fetch_result<uint64>(taichi_result_buffer_error_id);
+          });
+      TI_ERROR("Assertion failure: {}", error_message_formatted);
     } else {
       TI_NOT_IMPLEMENTED
     }
@@ -328,18 +469,25 @@ void Program::check_runtime_error() {
 
 void Program::synchronize() {
   if (!sync) {
-    if (config.arch == Arch::cuda) {
-#if defined(TI_WITH_CUDA)
-      CUDADriver::get_instance().stream_synchronize(nullptr);
-#else
-      TI_ERROR("No CUDA support");
-#endif
-    } else if (config.arch == Arch::metal) {
-      metal_kernel_mgr_->synchronize();
-    } else if (config.async == true) {
+    if (config.async_mode) {
       async_engine->synchronize();
     }
+    if (profiler)
+      profiler->sync();
+    device_synchronize();
     sync = true;
+  }
+}
+
+void Program::device_synchronize() {
+  if (config.arch == Arch::cuda) {
+#if defined(TI_WITH_CUDA)
+    CUDADriver::get_instance().stream_synchronize(nullptr);
+#else
+    TI_ERROR("No CUDA support");
+#endif
+  } else if (config.arch == Arch::metal) {
+    metal_kernel_mgr_->synchronize();
   }
 }
 
@@ -439,6 +587,8 @@ Arch Program::get_snode_accessor_arch() {
     return Arch::cuda;
   } else if (config.arch == Arch::metal) {
     return Arch::metal;
+  } else if (config.arch == Arch::cc) {
+    return Arch::cc;
   } else {
     return get_host_arch();
   }
@@ -447,20 +597,20 @@ Arch Program::get_snode_accessor_arch() {
 Kernel &Program::get_snode_reader(SNode *snode) {
   TI_ASSERT(snode->type == SNodeType::place);
   auto kernel_name = fmt::format("snode_reader_{}", snode->id);
-  auto &ker = kernel([&] {
+  auto &ker = kernel([snode] {
     ExprGroup indices;
     for (int i = 0; i < snode->num_active_indices; i++) {
-      indices.push_back(Expr::make<ArgLoadExpression>(i));
+      indices.push_back(Expr::make<ArgLoadExpression>(i, PrimitiveType::i32));
     }
     auto ret = Stmt::make<FrontendKernelReturnStmt>(
-        load_if_ptr((snode->expr)[indices]));
+        load_if_ptr((snode->expr)[indices]), snode->dt);
     current_ast_builder().insert(std::move(ret));
   });
   ker.set_arch(get_snode_accessor_arch());
   ker.name = kernel_name;
   ker.is_accessor = true;
   for (int i = 0; i < snode->num_active_indices; i++)
-    ker.insert_arg(DataType::i32, false);
+    ker.insert_arg(PrimitiveType::i32, false);
   ker.insert_ret(snode->dt);
   return ker;
 }
@@ -471,24 +621,26 @@ Kernel &Program::get_snode_writer(SNode *snode) {
   auto &ker = kernel([&] {
     ExprGroup indices;
     for (int i = 0; i < snode->num_active_indices; i++) {
-      indices.push_back(Expr::make<ArgLoadExpression>(i));
+      indices.push_back(Expr::make<ArgLoadExpression>(i, PrimitiveType::i32));
     }
     (snode->expr)[indices] =
-        Expr::make<ArgLoadExpression>(snode->num_active_indices);
+        Expr::make<ArgLoadExpression>(snode->num_active_indices, snode->dt);
   });
   ker.set_arch(get_snode_accessor_arch());
   ker.name = kernel_name;
   ker.is_accessor = true;
   for (int i = 0; i < snode->num_active_indices; i++)
-    ker.insert_arg(DataType::i32, false);
+    ker.insert_arg(PrimitiveType::i32, false);
   ker.insert_arg(snode->dt, false);
   return ker;
 }
 
 uint64 Program::fetch_result_uint64(int i) {
+  // TODO: We are likely doing more synchronization than necessary. Simplify the
+  // sync logic when we fetch the result.
+  device_synchronize();
   uint64 ret;
   auto arch = config.arch;
-  synchronize();
   if (arch == Arch::cuda) {
 #if defined(TI_WITH_CUDA)
     if (config.use_unified_memory) {
@@ -501,16 +653,17 @@ uint64 Program::fetch_result_uint64(int i) {
 #else
     TI_NOT_IMPLEMENTED;
 #endif
-  } else if (arch_is_cpu(arch)) {
-    ret = result_buffer[i];
   } else {
-    ret = context.get_arg_as_uint64(i);
+    ret = result_buffer[i];
   }
   return ret;
 }
 
 void Program::finalize() {
   synchronize();
+  if (async_engine)
+    async_engine = nullptr;  // Finalize the async engine threads before
+                             // anything else gets destoried.
   TI_TRACE("Program finalizing...");
   if (config.print_benchmark_stat) {
     const char *current_test = std::getenv("PYTEST_CURRENT_TEST");
@@ -529,6 +682,12 @@ void Program::finalize() {
       auto first_space_pos = file_name.find_first_of(' ');
       TI_ASSERT(first_space_pos != std::string::npos);
       file_name = file_name.substr(0, first_space_pos);
+      if (auto lt_pos = file_name.find('<'); lt_pos != std::string::npos) {
+        file_name[lt_pos] = '_';
+      }
+      if (auto gt_pos = file_name.find('>'); gt_pos != std::string::npos) {
+        file_name[gt_pos] = '_';
+      }
       file_name += ".dat";
       file_name = std::string(output_dir) + "/" + file_name;
       TI_INFO("Saving benchmark result to {}", file_name);
@@ -553,8 +712,109 @@ void Program::finalize() {
   TI_TRACE("Program ({}) finalized.", fmt::ptr(this));
 }
 
-void Program::launch_async(Kernel *kernel) {
-  async_engine->launch(kernel);
+int Program::default_block_dim() const {
+  if (arch_is_cpu(config.arch)) {
+    return config.default_cpu_block_dim;
+  } else {
+    return config.default_gpu_block_dim;
+  }
+}
+
+void Program::print_list_manager_info(void *list_manager) {
+  auto list_manager_len =
+      runtime_query<int32>("ListManager_get_num_elements", list_manager);
+
+  auto element_size =
+      runtime_query<int32>("ListManager_get_element_size", list_manager);
+
+  auto elements_per_chunk = runtime_query<int32>(
+      "ListManager_get_max_num_elements_per_chunk", list_manager);
+
+  auto num_active_chunks =
+      runtime_query<int32>("ListManager_get_num_active_chunks", list_manager);
+
+  auto size_MB = 1e-6f * num_active_chunks * elements_per_chunk * element_size;
+
+  fmt::print(
+      " length={:n}     {:n} chunks x [{:n} x {:n} B]  total={:.4f} MB\n",
+      list_manager_len, num_active_chunks, elements_per_chunk, element_size,
+      size_MB);
+}
+
+void Program::print_memory_profiler_info() {
+  TI_ASSERT(arch_uses_llvm(config.arch));
+
+  fmt::print("\n[Memory Profiler]\n");
+
+  std::locale::global(std::locale("en_US.UTF-8"));
+  // So that thousand separators are added to "{:n}" slots in fmtlib.
+  // E.g., 10000 is printed as "10,000".
+  // TODO: is there a way to set locale only locally in this function?
+
+  std::function<void(SNode *, int)> visit = [&](SNode *snode, int depth) {
+    auto element_list = runtime_query<void *>("LLVMRuntime_get_element_lists",
+                                              llvm_runtime, snode->id);
+
+    if (snode->type != SNodeType::place) {
+      fmt::print("SNode {:10}\n", snode->get_node_type_name_hinted());
+
+      if (element_list) {
+        fmt::print("  active element list:");
+        print_list_manager_info(element_list);
+
+        auto node_allocator = runtime_query<void *>(
+            "LLVMRuntime_get_node_allocators", llvm_runtime, snode->id);
+
+        if (node_allocator) {
+          auto free_list = runtime_query<void *>("NodeManager_get_free_list",
+                                                 node_allocator);
+          auto recycled_list = runtime_query<void *>(
+              "NodeManager_get_recycled_list", node_allocator);
+
+          auto free_list_len =
+              runtime_query<int32>("ListManager_get_num_elements", free_list);
+
+          auto recycled_list_len = runtime_query<int32>(
+              "ListManager_get_num_elements", recycled_list);
+
+          auto free_list_used = runtime_query<int32>(
+              "NodeManager_get_free_list_used", node_allocator);
+
+          auto data_list = runtime_query<void *>("NodeManager_get_data_list",
+                                                 node_allocator);
+          fmt::print("  data list:          ");
+          print_list_manager_info(data_list);
+
+          fmt::print(
+              "  Allocated elements={:n}; free list length={:n}; recycled list "
+              "length={:n}\n",
+              free_list_used, free_list_len, recycled_list_len);
+        }
+      }
+    }
+    for (const auto &ch : snode->ch) {
+      visit(ch.get(), depth + 1);
+    }
+  };
+
+  visit(snode_root.get(), 0);
+
+  auto total_requested_memory = runtime_query<std::size_t>(
+      "LLVMRuntime_get_total_requested_memory", llvm_runtime);
+
+  fmt::print(
+      "Total requested dynamic memory (excluding alignment padding): {:n} B\n",
+      total_requested_memory);
+}
+
+std::size_t Program::get_snode_num_dynamically_allocated(SNode *snode) {
+  auto node_allocator = runtime_query<void *>("LLVMRuntime_get_node_allocators",
+                                              llvm_runtime, snode->id);
+  auto data_list =
+      runtime_query<void *>("NodeManager_get_data_list", node_allocator);
+
+  return (std::size_t)runtime_query<int32>("ListManager_get_num_elements",
+                                           data_list);
 }
 
 Program::~Program() {

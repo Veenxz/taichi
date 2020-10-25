@@ -1,4 +1,3 @@
-# TODO: make test_element_wise slim (#1055)
 import taichi as ti
 import numpy as np
 from taichi import allclose
@@ -9,21 +8,19 @@ def _c_mod(a, b):
     return a - b * int(float(a) / b)
 
 
-@pytest.mark.parametrize('is_mat', [(True, True), (True, False),
-                                    (False, True)])
-@ti.all_archs
-def test_binary_f(is_mat):
-    lhs_is_mat, rhs_is_mat = is_mat
-
-    x = ti.Matrix(3, 2, ti.f32, 16)
+@pytest.mark.parametrize('lhs_is_mat,rhs_is_mat', [(True, True), (True, False),
+                                                   (False, True)])
+@ti.all_archs_with(fast_math=False)
+def test_binary_f(lhs_is_mat, rhs_is_mat):
+    x = ti.Matrix.field(3, 2, ti.f32, 16)
     if lhs_is_mat:
-        y = ti.Matrix(3, 2, ti.f32, ())
+        y = ti.Matrix.field(3, 2, ti.f32, ())
     else:
-        y = ti.var(ti.f32, ())
+        y = ti.field(ti.f32, ())
     if rhs_is_mat:
-        z = ti.Matrix(3, 2, ti.f32, ())
+        z = ti.Matrix.field(3, 2, ti.f32, ())
     else:
-        z = ti.var(ti.f32, ())
+        z = ti.field(ti.f32, ())
 
     if lhs_is_mat:
         y.from_numpy(np.array([[0, 2], [9, 3], [7, 4]], np.float32))
@@ -81,15 +78,15 @@ def test_binary_f(is_mat):
 def test_binary_i(is_mat):
     lhs_is_mat, rhs_is_mat = is_mat
 
-    x = ti.Matrix(3, 2, ti.i32, 19)
+    x = ti.Matrix.field(3, 2, ti.i32, 20)
     if lhs_is_mat:
-        y = ti.Matrix(3, 2, ti.i32, ())
+        y = ti.Matrix.field(3, 2, ti.i32, ())
     else:
-        y = ti.var(ti.i32, ())
+        y = ti.field(ti.i32, ())
     if rhs_is_mat:
-        z = ti.Matrix(3, 2, ti.i32, ())
+        z = ti.Matrix.field(3, 2, ti.i32, ())
     else:
-        z = ti.var(ti.i32, ())
+        z = ti.field(ti.i32, ())
 
     if lhs_is_mat:
         y.from_numpy(np.array([[0, 2], [9, 3], [7, 4]], np.int32))
@@ -121,6 +118,7 @@ def test_binary_i(is_mat):
         x[16] = y[None] | z[None]
         x[17] = ti.min(y[None], z[None])
         x[18] = ti.max(y[None], z[None])
+        x[19] = y[None] << z[None]
 
     func()
     x = x.to_numpy()
@@ -145,17 +143,18 @@ def test_binary_i(is_mat):
     assert allclose(x[16], y | z)
     assert allclose(x[17], np.minimum(y, z))
     assert allclose(x[18], np.maximum(y, z))
+    assert allclose(x[19], y << z)
 
 
 @pytest.mark.parametrize('rhs_is_mat', [True, False])
-@ti.all_archs
+@ti.all_archs_with(fast_math=False)
 def test_writeback_binary_f(rhs_is_mat):
-    x = ti.Matrix(3, 2, ti.f32, 9)
-    y = ti.Matrix(3, 2, ti.f32, ())
+    x = ti.Matrix.field(3, 2, ti.f32, 9)
+    y = ti.Matrix.field(3, 2, ti.f32, ())
     if rhs_is_mat:
-        z = ti.Matrix(3, 2, ti.f32, ())
+        z = ti.Matrix.field(3, 2, ti.f32, ())
     else:
-        z = ti.var(ti.f32, ())
+        z = ti.field(ti.f32, ())
 
     y.from_numpy(np.array([[0, 2], [9, 3], [7, 4]], np.float32))
     if rhs_is_mat:
@@ -197,12 +196,12 @@ def test_writeback_binary_f(rhs_is_mat):
 @pytest.mark.parametrize('rhs_is_mat', [(True, True), (True, False)])
 @ti.all_archs
 def test_writeback_binary_i(rhs_is_mat):
-    x = ti.Matrix(3, 2, ti.i32, 12)
-    y = ti.Matrix(3, 2, ti.i32, ())
+    x = ti.Matrix.field(3, 2, ti.i32, 12)
+    y = ti.Matrix.field(3, 2, ti.i32, ())
     if rhs_is_mat:
-        z = ti.Matrix(3, 2, ti.i32, ())
+        z = ti.Matrix.field(3, 2, ti.i32, ())
     else:
-        z = ti.var(ti.i32, ())
+        z = ti.field(ti.i32, ())
 
     y.from_numpy(np.array([[0, 2], [9, 3], [7, 4]], np.int32))
     if rhs_is_mat:
@@ -244,10 +243,10 @@ def test_writeback_binary_i(rhs_is_mat):
 
 @ti.all_archs
 def test_unary():
-    xi = ti.Matrix(3, 2, ti.i32, 4)
-    yi = ti.Matrix(3, 2, ti.i32, ())
-    xf = ti.Matrix(3, 2, ti.f32, 13)
-    yf = ti.Matrix(3, 2, ti.f32, ())
+    xi = ti.Matrix.field(3, 2, ti.i32, 4)
+    yi = ti.Matrix.field(3, 2, ti.i32, ())
+    xf = ti.Matrix.field(3, 2, ti.f32, 14)
+    yf = ti.Matrix.field(3, 2, ti.f32, ())
 
     yi.from_numpy(np.array([[3, 2], [9, 0], [7, 4]], np.int32))
     yf.from_numpy(np.array([[0.3, 0.2], [0.9, 0.1], [0.7, 0.4]], np.float32))
@@ -271,6 +270,7 @@ def test_unary():
         xf[10] = ti.ceil(yf[None])
         xf[11] = ti.exp(yf[None])
         xf[12] = ti.log(yf[None])
+        xf[13] = ti.rsqrt(yf[None])
 
     func()
     xi = xi.to_numpy()
@@ -293,3 +293,50 @@ def test_unary():
     assert allclose(xf[10], np.ceil(yf))
     assert allclose(xf[11], np.exp(yf))
     assert allclose(xf[12], np.log(yf))
+    assert allclose(xf[13], 1 / np.sqrt(yf))
+
+
+@pytest.mark.parametrize('is_mat', [(True, True, True), (True, False, False),
+                                    (False, True, False), (False, False, True),
+                                    (False, True, True)])
+@ti.all_archs
+def test_ternary_i(is_mat):
+    cond_is_mat, lhs_is_mat, rhs_is_mat = is_mat
+    x = ti.Matrix.field(3, 2, ti.i32, 1)
+    if cond_is_mat:
+        y = ti.Matrix.field(3, 2, ti.i32, ())
+    else:
+        y = ti.field(ti.i32, ())
+    if lhs_is_mat:
+        z = ti.Matrix.field(3, 2, ti.i32, ())
+    else:
+        z = ti.field(ti.i32, ())
+    if rhs_is_mat:
+        w = ti.Matrix.field(3, 2, ti.i32, ())
+    else:
+        w = ti.field(ti.i32, ())
+
+    if cond_is_mat:
+        y.from_numpy(np.array([[0, 2], [9, 0], [7, 4]], np.int32))
+    else:
+        y[None] = 0
+    if lhs_is_mat:
+        z.from_numpy(np.array([[4, 5], [6, 3], [9, 2]], np.int32))
+    else:
+        z[None] = 5
+    if rhs_is_mat:
+        w.from_numpy(np.array([[4, 5], [6, 3], [9, 2]], np.int32))
+    else:
+        w[None] = 4
+
+    @ti.kernel
+    def func():
+        x[0] = z[None] if y[None] else w[None]
+
+    func()
+    x = x.to_numpy()
+    y = y.to_numpy()
+    z = z.to_numpy()
+    w = w.to_numpy()
+    assert allclose(x[0],
+                    np.int32(np.bool_(y)) * z + np.int32(1 - np.bool_(y)) * w)

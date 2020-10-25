@@ -4,22 +4,35 @@
 
 #include "taichi/program/kernel.h"
 #define TI_RUNTIME_HOST
-#include "taichi/runtime/llvm/context.h"
+#include "taichi/program/context.h"
 #undef TI_RUNTIME_HOST
 
 TLANG_NAMESPACE_BEGIN
 
 namespace metal {
 
+int PrintStringTable::put(const std::string &str) {
+  int i = 0;
+  for (; i < strs_.size(); ++i) {
+    if (str == strs_[i]) {
+      return i;
+    }
+  }
+  strs_.push_back(str);
+  return i;
+}
+
+const std::string &PrintStringTable::get(int i) {
+  return strs_[i];
+}
+
 // static
 std::string KernelAttributes::buffers_name(Buffers b) {
 #define REGISTER_NAME(x) \
   { Buffers::x, #x }
   const static std::unordered_map<Buffers, std::string> m = {
-      REGISTER_NAME(Root),
-      REGISTER_NAME(GlobalTmps),
-      REGISTER_NAME(Context),
-      REGISTER_NAME(Runtime),
+      REGISTER_NAME(Root),    REGISTER_NAME(GlobalTmps), REGISTER_NAME(Context),
+      REGISTER_NAME(Runtime), REGISTER_NAME(Print),
   };
 #undef REGISTER_NAME
   return m.find(b)->second;
@@ -28,16 +41,17 @@ std::string KernelAttributes::buffers_name(Buffers b) {
 std::string KernelAttributes::debug_string() const {
   std::string result;
   result += fmt::format(
-      "<KernelAttributes name={} num_threads={} task_type={} buffers=[ ", name,
-      num_threads, OffloadedStmt::task_type_name(task_type));
+      "<KernelAttributes name={} num_threads={} num_threads_per_group={} "
+      "task_type={} buffers=[ ",
+      name, advisory_total_num_threads, advisory_num_threads_per_group,
+      offloaded_task_type_name(task_type));
   for (auto b : buffers) {
     result += buffers_name(b) + " ";
   }
   result += "]";  // closes |buffers|
   // TODO(k-ye): show range_for
-  if (task_type == OffloadedStmt::TaskType::clear_list ||
-      task_type == OffloadedStmt::TaskType::listgen) {
-    result += fmt::format(" snode={}", runtime_list_op_attribs.snode->id);
+  if (task_type == OffloadedTaskType::listgen) {
+    result += fmt::format(" snode={}", runtime_list_op_attribs->snode->id);
   }
   result += ">";
   return result;

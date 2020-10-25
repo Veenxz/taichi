@@ -4,6 +4,9 @@ from .transformer import ASTTransformer
 import ast
 from .kernel_arguments import *
 from .util import *
+from .shell import oinspect, _shell_pop_print
+from .exception import TaichiSyntaxError
+from . import impl
 import functools
 
 
@@ -28,65 +31,80 @@ def remove_indent(lines):
 
 # The ti.func decorator
 def func(foo):
-    if _inside_class(level_of_class_stackframe=3):
-        func = Func(foo, classfunc=True)
+    is_classfunc = _inside_class(level_of_class_stackframe=3)
 
-        @functools.wraps(foo)
-        def decorated(*args):
-            return func.__call__(*args)
+    _taichi_skip_traceback = 1
+    fun = Func(foo, classfunc=is_classfunc)
 
-        return decorated
-    else:
-        return Func(foo)
+    @functools.wraps(foo)
+    def decorated(*args):
+        _taichi_skip_traceback = 1
+        return fun.__call__(*args)
+
+    return decorated
+
+
+# The ti.pyfunc decorator
+def pyfunc(foo):
+    '''
+    Creates a function that are callable both in Taichi-scope and Python-scope.
+    The function should be simple, and not contains Taichi-scope specifc syntax
+    including struct-for.
+    '''
+    is_classfunc = _inside_class(level_of_class_stackframe=3)
+    fun = Func(foo, classfunc=is_classfunc, pyfunc=True)
+
+    @functools.wraps(foo)
+    def decorated(*args):
+        _taichi_skip_traceback = 1
+        return fun.__call__(*args)
+
+    return decorated
 
 
 class Func:
-    def __init__(self, func, classfunc=False):
+    def __init__(self, func, classfunc=False, pyfunc=False):
         self.func = func
         self.compiled = None
         self.classfunc = classfunc
+        self.pyfunc = pyfunc
         self.arguments = []
         self.argument_names = []
+        _taichi_skip_traceback = 1
         self.extract_arguments()
 
     def __call__(self, *args):
+        _taichi_skip_traceback = 1
+        if not impl.inside_kernel():
+            if not self.pyfunc:
+                raise TaichiSyntaxError(
+                    "Taichi functions cannot be called from Python-scope."
+                    " Use @ti.pyfunc if you wish to call Taichi functions "
+                    "from both Python-scope and Taichi-scope.")
+            return self.func(*args)
         if self.compiled is None:
             self.do_compile()
         ret = self.compiled(*args)
         return ret
 
     def do_compile(self):
-        from .impl import get_runtime
-        src = remove_indent(inspect.getsource(self.func))
+        src = remove_indent(oinspect.getsource(self.func))
         tree = ast.parse(src)
 
         func_body = tree.body[0]
         func_body.decorator_list = []
 
-        if get_runtime().print_preprocessed:
-            import astor
-            print('Before preprocessing:')
-            print(astor.to_source(tree.body[0], indent_with='  '))
-
         visitor = ASTTransformer(is_kernel=False, func=self)
         visitor.visit(tree)
-        ast.fix_missing_locations(tree)
 
-        if get_runtime().print_preprocessed:
-            import astor
-            print('After preprocessing:')
-            print(astor.to_source(tree.body[0], indent_with='  '))
-
-        ast.increment_lineno(tree, inspect.getsourcelines(self.func)[1] - 1)
+        ast.increment_lineno(tree, oinspect.getsourcelines(self.func)[1] - 1)
 
         local_vars = {}
-        #frame = inspect.currentframe().f_back
-        #global_vars = dict(frame.f_globals, **frame.f_locals)
-        import copy
-        global_vars = copy.copy(self.func.__globals__)
+        global_vars = _get_global_vars(self.func)
+
         exec(
             compile(tree,
-                    filename=inspect.getsourcefile(self.func),
+                    filename=oinspect.getsourcefile(self.func),
                     mode='exec'), global_vars, local_vars)
         self.compiled = local_vars[self.func.__name__]
 
@@ -100,36 +118,38 @@ class Func:
             param = params[arg_name]
             if param.kind == inspect.Parameter.VAR_KEYWORD:
                 raise KernelDefError(
-                    'Taichi funcs do not support variable keyword parameters (i.e., **kwargs)'
+                    'Taichi functions do not support variable keyword parameters (i.e., **kwargs)'
                 )
             if param.kind == inspect.Parameter.VAR_POSITIONAL:
                 raise KernelDefError(
-                    'Taichi funcs do not support variable positional parameters (i.e., *args)'
+                    'Taichi functions do not support variable positional parameters (i.e., *args)'
                 )
             if param.kind == inspect.Parameter.KEYWORD_ONLY:
                 raise KernelDefError(
-                    'Taichi funcs do not support keyword parameters')
+                    'Taichi functions do not support keyword parameters')
             if param.kind != inspect.Parameter.POSITIONAL_OR_KEYWORD:
                 raise KernelDefError(
-                    'Taichi funcs only support "positional or keyword" parameters'
+                    'Taichi functions only support "positional or keyword" parameters'
                 )
             annotation = param.annotation
-            if param.annotation is inspect.Parameter.empty:
+            if annotation is inspect.Parameter.empty:
                 if i == 0 and self.classfunc:
                     annotation = template()
+            else:
+                if id(annotation) in type_ids:
+                    warning(
+                        'Data type annotations are unnecessary for Taichi'
+                        ' functions, consider removing it',
+                        stacklevel=4)
+                elif not isinstance(annotation, template):
+                    raise KernelDefError(
+                        f'Invalid type annotation (argument {i}) of Taichi function: {annotation}'
+                    )
             self.arguments.append(annotation)
             self.argument_names.append(param.name)
 
 
-@deprecated('@ti.classfunc', '@ti.func directly')
-def classfunc(foo):
-    func = Func(foo, classfunc=True)
-
-    @functools.wraps(foo)
-    def decorated(*args):
-        return func.__call__(*args)
-
-    return decorated
+classfunc = obsolete('@ti.classfunc', '@ti.func directly')
 
 
 class KernelTemplateMapper:
@@ -151,7 +171,8 @@ class KernelTemplateMapper:
 
     def lookup(self, args):
         if len(args) != self.num_args:
-            raise Exception(
+            _taichi_skip_traceback = 1
+            raise TypeError(
                 f'{self.num_args} argument(s) needed but {len(args)} provided.'
             )
 
@@ -178,6 +199,21 @@ class KernelArgError(Exception):
             self.pos, str(self.needed), str(self.provided))
 
 
+def _get_global_vars(func):
+    # Discussions: https://github.com/taichi-dev/taichi/issues/282
+    import copy
+    global_vars = copy.copy(func.__globals__)
+
+    freevar_names = func.__code__.co_freevars
+    closure = func.__closure__
+    if closure:
+        freevar_values = list(map(lambda x: x.cell_contents, closure))
+        for name, value in zip(freevar_names, freevar_values):
+            global_vars[name] = value
+
+    return global_vars
+
+
 class Kernel:
     counter = 0
 
@@ -190,20 +226,20 @@ class Kernel:
         self.argument_names = []
         self.return_type = None
         self.classkernel = classkernel
+        _taichi_skip_traceback = 1
         self.extract_arguments()
+        del _taichi_skip_traceback
         self.template_slot_locations = []
         for i in range(len(self.arguments)):
             if isinstance(self.arguments[i], template):
                 self.template_slot_locations.append(i)
         self.mapper = KernelTemplateMapper(self.arguments,
                                            self.template_slot_locations)
-        from .impl import get_runtime
-        get_runtime().kernels.append(self)
+        impl.get_runtime().kernels.append(self)
         self.reset()
 
     def reset(self):
-        from .impl import get_runtime
-        self.runtime = get_runtime()
+        self.runtime = impl.get_runtime()
         if self.is_grad:
             self.compiled_functions = self.runtime.compiled_functions
         else:
@@ -241,12 +277,24 @@ class Kernel:
                 if i == 0 and self.classkernel:
                     annotation = template()
                 else:
+                    _taichi_skip_traceback = 1
                     raise KernelDefError(
                         'Taichi kernels parameters must be type annotated')
+            else:
+                if isinstance(annotation, (template, ext_arr)):
+                    pass
+                elif id(annotation) in type_ids:
+                    pass
+                else:
+                    _taichi_skip_traceback = 1
+                    raise KernelDefError(
+                        f'Invalid type annotation (argument {i}) of Taichi kernel: {annotation}'
+                    )
             self.arguments.append(annotation)
             self.argument_names.append(param.name)
 
     def materialize(self, key=None, args=None, arg_features=None):
+        _taichi_skip_traceback = 1
         if key is None:
             key = (self.func, 0)
         if not self.runtime.materialized:
@@ -262,20 +310,14 @@ class Kernel:
         import taichi as ti
         ti.trace("Compiling kernel {}...".format(kernel_name))
 
-        src = remove_indent(inspect.getsource(self.func))
+        src = remove_indent(oinspect.getsource(self.func))
         tree = ast.parse(src)
-        if self.runtime.print_preprocessed:
-            import astor
-            print('Before preprocessing:')
-            print(astor.to_source(tree.body[0]))
 
         func_body = tree.body[0]
         func_body.decorator_list = []
 
         local_vars = {}
-        # Discussions: https://github.com/yuanming-hu/taichi/issues/282
-        import copy
-        global_vars = copy.copy(self.func.__globals__)
+        global_vars = _get_global_vars(self.func)
 
         for i, arg in enumerate(func_body.args.args):
             anno = arg.annotation
@@ -295,21 +337,8 @@ class Kernel:
             arg_features=arg_features)
 
         visitor.visit(tree)
-        ast.fix_missing_locations(tree)
 
-        if self.runtime.print_preprocessed:
-            import astor
-            print('After preprocessing:')
-            print(astor.to_source(tree.body[0], indent_with='  '))
-
-        ast.increment_lineno(tree, inspect.getsourcelines(self.func)[1] - 1)
-
-        freevar_names = self.func.__code__.co_freevars
-        closure = self.func.__closure__
-        if closure:
-            freevar_values = list(map(lambda x: x.cell_contents, closure))
-            for name, value in zip(freevar_names, freevar_values):
-                global_vars[name] = value
+        ast.increment_lineno(tree, oinspect.getsourcelines(self.func)[1] - 1)
 
         # inject template parameters into globals
         for i in self.template_slot_locations:
@@ -318,7 +347,7 @@ class Kernel:
 
         exec(
             compile(tree,
-                    filename=inspect.getsourcefile(self.func),
+                    filename=oinspect.getsourcefile(self.func),
                     mode='exec'), global_vars, local_vars)
         compiled = local_vars[self.func.__name__]
 
@@ -328,9 +357,10 @@ class Kernel:
         # Do not change the name of 'taichi_ast_generator'
         # The warning system needs this identifier to remove unnecessary messages
         def taichi_ast_generator():
+            _taichi_skip_traceback = 1
             if self.runtime.inside_kernel:
                 import taichi as ti
-                raise ti.TaichiSyntaxError(
+                raise TaichiSyntaxError(
                     "Kernels cannot call other kernels. I.e., nested kernels are not allowed. Please check if you have direct/indirect invocation of kernels within kernels. Note that some methods provided by the Taichi standard library may invoke kernels, and please move their invocations to Python-scope."
                 )
             self.runtime.inside_kernel = True
@@ -351,32 +381,34 @@ class Kernel:
 
             tmps = []
             callbacks = []
+            has_external_arrays = False
 
             actual_argument_slot = 0
+            launch_ctx = t_kernel.make_launch_context()
             for i, v in enumerate(args):
                 needed = self.arguments[i]
                 if isinstance(needed, template):
                     continue
                 provided = type(v)
-                # Note: do not use sth like needed == f32. That would be slow.
+                # Note: do not use sth like "needed == f32". That would be slow.
                 if id(needed) in real_type_ids:
                     if not isinstance(v, (float, int)):
                         raise KernelArgError(i, needed, provided)
-                    t_kernel.set_arg_float(actual_argument_slot, float(v))
+                    launch_ctx.set_arg_float(actual_argument_slot, float(v))
                 elif id(needed) in integer_type_ids:
                     if not isinstance(v, int):
                         raise KernelArgError(i, needed, provided)
-                    t_kernel.set_arg_int(actual_argument_slot, int(v))
+                    launch_ctx.set_arg_int(actual_argument_slot, int(v))
                 elif self.match_ext_arr(v, needed):
-                    dt = to_taichi_type(v.dtype)
+                    has_external_arrays = True
                     has_torch = has_pytorch()
                     is_numpy = isinstance(v, np.ndarray)
                     if is_numpy:
                         tmp = np.ascontiguousarray(v)
                         tmps.append(tmp)  # Purpose: do not GC tmp!
-                        t_kernel.set_arg_nparray(actual_argument_slot,
-                                                 int(tmp.ctypes.data),
-                                                 tmp.nbytes)
+                        launch_ctx.set_arg_nparray(actual_argument_slot,
+                                                   int(tmp.ctypes.data),
+                                                   tmp.nbytes)
                     else:
 
                         def get_call_back(u, v):
@@ -402,7 +434,7 @@ class Kernel:
                                 gpu_v = v.cuda()
                                 tmp = gpu_v
                                 callbacks.append(get_call_back(v, gpu_v))
-                        t_kernel.set_arg_nparray(
+                        launch_ctx.set_arg_nparray(
                             actual_argument_slot, int(tmp.data_ptr()),
                             tmp.element_size() * tmp.nelement())
                     shape = v.shape
@@ -412,29 +444,36 @@ class Kernel:
                     ) <= max_num_indices, "External array cannot have > {} indices".format(
                         max_num_indices)
                     for i, s in enumerate(shape):
-                        t_kernel.set_extra_arg_int(actual_argument_slot, i, s)
+                        launch_ctx.set_extra_arg_int(actual_argument_slot, i,
+                                                     s)
                 else:
-                    assert False
+                    raise ValueError(
+                        f'Argument type mismatch. Expecting {needed}, got {type(v)}.'
+                    )
                 actual_argument_slot += 1
             # Both the class kernels and the plain-function kernels are unified now.
             # In both cases, |self.grad| is another Kernel instance that computes the
-            # gradient. For class kerenls, args[0] is always the kernel owner.
+            # gradient. For class kernels, args[0] is always the kernel owner.
             if not self.is_grad and self.runtime.target_tape and not self.runtime.inside_complex_kernel:
                 self.runtime.target_tape.insert(self, args)
 
-            t_kernel()
+            t_kernel(launch_ctx)
 
             ret = None
             ret_dt = self.return_type
-            if ret_dt is not None:
-                if taichi_lang_core.is_integral(ret_dt):
+            has_ret = ret_dt is not None
+
+            if has_external_arrays or has_ret:
+                import taichi as ti
+                ti.sync()
+
+            if has_ret:
+                if id(ret_dt) in integer_type_ids:
                     ret = t_kernel.get_ret_int(0)
                 else:
                     ret = t_kernel.get_ret_float(0)
 
             if callbacks:
-                import taichi as ti
-                ti.sync()
                 for c in callbacks:
                     c()
 
@@ -453,7 +492,9 @@ class Kernel:
 
     # For small kernels (< 3us), the performance can be pretty sensitive to overhead in __call__
     # Thus this part needs to be fast. (i.e. < 3us on a 4 GHz x64 CPU)
+    @_shell_pop_print
     def __call__(self, *args, **kwargs):
+        _taichi_skip_traceback = 1
         assert len(kwargs) == 0, 'kwargs not supported for Taichi kernels'
         instance_id, arg_features = self.mapper.lookup(args)
         key = (self.func, instance_id)
@@ -481,8 +522,7 @@ _KERNEL_CLASS_STACKFRAME_STMT_RES = [
 
 
 def _inside_class(level_of_class_stackframe):
-    import inspect
-    frames = inspect.stack()
+    frames = oinspect.stack()
     try:
         maybe_class_frame = frames[level_of_class_stackframe]
         statement_list = maybe_class_frame[4]
@@ -499,6 +539,7 @@ def _kernel_impl(func, level_of_class_stackframe, verbose=False):
     # Can decorators determine if a function is being defined inside a class?
     # https://stackoverflow.com/a/8793684/12003165
     is_classkernel = _inside_class(level_of_class_stackframe + 1)
+    _taichi_skip_traceback = 1
 
     if verbose:
         print(f'kernel={func.__name__} is_classkernel={is_classkernel}')
@@ -507,7 +548,6 @@ def _kernel_impl(func, level_of_class_stackframe, verbose=False):
     # Having |primal| contains |grad| makes the tape work.
     primal.grad = adjoint
 
-    from functools import wraps
     if is_classkernel:
         # For class kernels, their primal/adjoint callables are constructed when the
         # kernel is accessed via the instance inside BoundedDifferentiableMethod.
@@ -515,18 +555,21 @@ def _kernel_impl(func, level_of_class_stackframe, verbose=False):
         # owning the kernel, which is not known until the kernel is accessed.
         #
         # See also: BoundedDifferentiableMethod, data_oriented.
-        @wraps(func)
+        @functools.wraps(func)
         def wrapped(*args, **kwargs):
+            _taichi_skip_traceback = 1
             # If we reach here (we should never), it means the class is not decorated
-            # with @data_oriented, otherwise getattr would have intercepted the call.
+            # with @ti.data_oriented, otherwise getattr would have intercepted the call.
             clsobj = type(args[0])
             assert not hasattr(clsobj, '_data_oriented')
             raise KernelDefError(
-                f'Please decorate class {clsobj.__name__} with @data_oriented')
+                f'Please decorate class {clsobj.__name__} with @ti.data_oriented'
+            )
     else:
 
-        @wraps(func)
+        @functools.wraps(func)
         def wrapped(*args, **kwargs):
+            _taichi_skip_traceback = 1
             return primal(*args, **kwargs)
 
         wrapped.grad = adjoint
@@ -539,12 +582,11 @@ def _kernel_impl(func, level_of_class_stackframe, verbose=False):
 
 
 def kernel(func):
+    _taichi_skip_traceback = 1
     return _kernel_impl(func, level_of_class_stackframe=3)
 
 
-@deprecated('@ti.classkernel', '@ti.kernel directly')
-def classkernel(func):
-    return _kernel_impl(func, level_of_class_stackframe=3)
+classkernel = obsolete('@ti.classkernel', '@ti.kernel directly')
 
 
 class BoundedDifferentiableMethod:
@@ -552,25 +594,30 @@ class BoundedDifferentiableMethod:
         clsobj = type(kernel_owner)
         if not getattr(clsobj, '_data_oriented', False):
             raise KernelDefError(
-                f'Please decorate class {clsobj.__name__} with @data_oriented')
+                f'Please decorate class {clsobj.__name__} with @ti.data_oriented'
+            )
         self._kernel_owner = kernel_owner
         self._primal = wrapped_kernel_func._primal
         self._adjoint = wrapped_kernel_func._adjoint
 
     def __call__(self, *args, **kwargs):
+        _taichi_skip_traceback = 1
         return self._primal(self._kernel_owner, *args, **kwargs)
 
     def grad(self, *args, **kwargs):
+        _taichi_skip_traceback = 1
         return self._adjoint(self._kernel_owner, *args, **kwargs)
 
 
 def data_oriented(cls):
     def getattr(self, item):
+        _taichi_skip_traceback = 1
         x = super(cls, self).__getattribute__(item)
         if hasattr(x, '_is_wrapped_kernel'):
-            import inspect
-            assert inspect.ismethod(x)
-            wrapped = x.__func__
+            if inspect.ismethod(x):
+                wrapped = x.__func__
+            else:
+                wrapped = x
             assert inspect.isfunction(wrapped)
             if wrapped._is_classkernel:
                 return BoundedDifferentiableMethod(self, wrapped)

@@ -2,19 +2,17 @@ import taichi as ti
 from taichi import approx
 
 
-@ti.all_archs
+@ti.test()
 def test_ad_reduce():
-    x = ti.var(ti.f32)
-    loss = ti.var(ti.f32)
-
     N = 16
 
-    ti.root.place(loss, loss.grad).dense(ti.i, N).place(x, x.grad)
+    x = ti.field(dtype=ti.f32, shape=N, needs_grad=True)
+    loss = ti.field(dtype=ti.f32, shape=(), needs_grad=True)
 
     @ti.kernel
     def func():
         for i in x:
-            loss.atomic_add(x[i]**2)
+            loss[None] += x[i]**2
 
     total_loss = 0
     for i in range(N):

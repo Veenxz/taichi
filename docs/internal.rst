@@ -3,7 +3,103 @@ Internal designs (WIP)
 
 Intermediate representation
 ---------------------------
+
 Use ``ti.init(print_ir=True)`` to print IR on the console.
+
+See :ref:`compilation` for more details about the JIT system of Taichi.
+
+
+Data structure organization
+---------------------------
+
+The internal organization of Taichi's data structure can be confusing.
+It is important to distinguish the concept of **containers**, **cells**, and **components**.
+
+- A **container** can have multiple **cells**. The numbers of **cells** are recommended to be powers of two.
+- A **cell** can have multiple **components**.
+- Each **component** is a **container** of a lower-level SNode.
+
+Note that containers of ``place`` SNodes do have cells. Instead, they directly contain numerical values.
+
+Consider the following example:
+
+.. code-block:: python
+
+    # misc/listgen_demo.py
+
+    x = ti.field(ti.i32)
+    y = ti.field(ti.i32)
+    z = ti.field(ti.i32)
+
+    S0 = ti.root
+    S1 = S0.pointer(ti.i, 4)
+
+    S2 = S1.dense(ti.i, 2)
+    S2.place(x, y) # S3: x; S4: y
+
+    S5 = S1.dense(ti.i, 2)
+    S5.place(z) # S6: z
+
+
+- The whole data structure is an ``S0root`` **container**, containing
+
+  - ``1x`` ``S0root`` **cell**, which has only one **component**, which is
+
+    - An ``S1pointer`` **container**, containing
+
+      - 4x ``S1pointer`` **cells**, each with two **components**, which are
+
+        - An ``S2dense`` **container**, containing
+
+          - 2x ``S2dense`` **cells**, each with two **components**, which are
+
+            - An ``S3place_x`` container which directly contains a ``x: ti.i32`` value
+            - An ``S4place_y`` container which directly contains a ``y: ti.i32`` value
+
+        - An ``S5dense`` **container**, containing
+
+          - 2x ``S5dense`` **cells**, each with one **component**, which is
+
+            - An ``S6place`` container which directly contains a ``z: ti.i32`` value
+
+
+The following figure shows the hierarchy of the data structure. The numbers are ``indices`` of the containers and cells.
+
+.. image:: https://raw.githubusercontent.com/taichi-dev/public_files/fa03e63ca4e161318c8aa9a5db7f4a825604df88/taichi/data_structure_organization.png
+
+Note that the ``S0root`` container and cell do not have an ``index``.
+
+In summary, we will have the following containers:
+
+  - ``1 S0root`` container
+  - ``1 S1pointer`` container
+  - ``4 S2dense`` containers
+  - ``4 S5dense`` containers
+  - ``8 S3place_x`` containers, each directly contains an ``i32`` value
+  - ``8 S4place_y`` containers, each directly contains an ``i32`` value
+  - ``8 S6place_z`` containers, each directly contains an ``i32`` value
+
+... and the following cells:
+
+  - ``1 S0root`` cell
+  - ``4 S1pointer`` cells
+  - ``8 S2dense`` cells
+  - ``8 S5dense`` cells
+
+Again, note that ``S3place_x, S4place_x, S6place_x`` SNodes do **not** have corresponding cells.
+
+
+In struct compilers, each SNode has two types: ``container`` type and ``cell`` type.
+**Components** of a higher level SNode **cell** are **containers** of a lower level SNode.
+
+Note that **cells** are never exposed to end-users.
+
+**List generation** generates lists of SNode **containers** (instead of SNode **cells**).
+
+.. note::
+
+    We are on our way to remove usages of **children**, **instances**, and **elements** in Taichi.
+    These are very ambiguous terms.
 
 
 List generation (WIP)
@@ -31,8 +127,12 @@ For example,
 
     ti.init(print_ir=True)
 
-    x = ti.var(ti.i32)
-    ti.root.dense(ti.i, 4).bitmasked(ti.i, 4).place(x)
+    x = ti.field(ti.i32)
+
+    S0 = ti.root
+    S1 = S0.dense(ti.i, 4)
+    S2 = S1.bitmasked(ti.i, 4)
+    S2.place(x)
 
     @ti.kernel
     def func():
@@ -77,10 +177,6 @@ The list of ``root`` node always has exactly one element (instance), so we never
 
     In the example above, although we have ``16`` instances of ``x``,
     we only generate a list of ``4`` ``bitmasked`` nodes (and ``1`` ``dense`` node).
-
-
-Code generation
----------------
 
 
 Statistics
@@ -130,6 +226,55 @@ However, this design has drawbacks as well:
 
 * Taichi kernels must parse-able by Python parsers. This means Taichi syntax cannot go beyond Python syntax.
 
-  * For example, indexing is always needed when accessing elements in Taichi tensors, even if the tensor is 0D. Use ``x[None] = 123`` to set the value in ``x`` if ``x`` is 0D. This is because ``x = 123`` will set ``x`` itself (instead of its containing value) to be the constant ``123`` in python syntax, and, unfortunately, we cannot modify this behavior.
+  * For example, indexing is always needed when accessing elements in Taichi fields, even if the fields is 0D. Use ``x[None] = 123`` to set the value in ``x`` if ``x`` is 0D. This is because ``x = 123`` will set ``x`` itself (instead of its containing value) to be the constant ``123`` in python syntax, and, unfortunately, we cannot modify this behavior.
 
-* Python has relatively low performance. This can cause a performance issue when initializing large Taichi tensors with pure python scripts. A Taichi kernel should be used to initialize a huge tensor.
+* Python has relatively low performance. This can cause a performance issue when initializing large Taichi fields with pure python scripts. A Taichi kernel should be used to initialize a huge fields.
+
+
+Virtual indices v.s. physical indices
+-------------------------------------
+
+In Taichi, *virtual indices* are used to locate elements in fields, and *physical indices*
+are used to specify data layouts in memory.
+
+For example,
+
+ - In ``a[i, j, k]``, ``i``, ``j``, and ``k`` are **virtual** indices.
+ - In ``for i, j in x:``, ``i`` and ``j`` are **virtual** indices.
+ - ``ti.i, ti.j, ti.k, ti.l, ...`` are **physical** indices.
+ - In struct-for statements, ``LoopIndexStmt::index`` is a **physical** index.
+
+The mapping between virtual indices and physical indices for each ``SNode`` is
+stored in ``SNode::physical_index_position``.
+I.e.,  ``physical_index_position[i]`` answers the question: **which physical index does the i-th virtual index**
+correspond to?
+
+Each ``SNode`` can have a different virtual-to-physical mapping. ``physical_index_position[i] == -1``
+means the ``i``-th virtual index does not corrspond to any physical index in this ``SNode``.
+
+``SNode`` s in handy dense fields (i.e., ``a = ti.field(ti.i32, shape=(128, 256, 512))``)
+have **trivial** virtual-to-physical mapping, e.g. ``physical_index_position[i] = i``.
+
+However, more complex data layouts, such as column-major 2D fields can lead to ``SNodes`` with
+``physical_index_position[0] = 1`` and ``physical_index_position[1] = 0``.
+
+.. code-block:: python
+
+    a = ti.field(ti.f32, shape=(128, 32, 8))
+
+    b = ti.field(ti.f32)
+    ti.root.dense(ti.j, 32).dense(ti.i, 16).place(b)
+
+    ti.get_runtime().materialize()
+
+    mapping_a = a.snode().physical_index_position()
+
+    assert mapping_a == {0: 0, 1: 1, 2: 2}
+
+    mapping_b = b.snode().physical_index_position()
+
+    assert mapping_b == {0: 1, 1: 0}
+    # Note that b is column-major:
+    # the virtual first index exposed to the user comes second in memory layout.
+
+Taichi supports up to 8 (``constexpr int taichi_max_num_indices = 8``) virtual indices and physical indices.

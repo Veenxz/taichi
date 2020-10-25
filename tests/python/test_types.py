@@ -6,7 +6,7 @@ _TI_64_TYPES = [ti.i64, ti.u64, ti.f64]
 
 
 def _test_type_assign_argument(dt):
-    x = ti.var(dt, shape=())
+    x = ti.field(dt, shape=())
 
     @ti.kernel
     def func(value: dt):
@@ -30,10 +30,10 @@ def test_type_assign_argument64(dt):
 
 
 def _test_type_operator(dt):
-    x = ti.var(dt, shape=())
-    y = ti.var(dt, shape=())
-    add = ti.var(dt, shape=())
-    mul = ti.var(dt, shape=())
+    x = ti.field(dt, shape=())
+    y = ti.field(dt, shape=())
+    add = ti.field(dt, shape=())
+    mul = ti.field(dt, shape=())
 
     @ti.kernel
     def func():
@@ -62,8 +62,8 @@ def test_type_operator64(dt):
     _test_type_operator(dt)
 
 
-def _test_type_tensor(dt):
-    x = ti.var(dt, shape=(3, 2))
+def _test_type_field(dt):
+    x = ti.field(dt, shape=(3, 2))
 
     @ti.kernel
     def func(i: ti.i32, j: ti.i32):
@@ -77,21 +77,21 @@ def _test_type_tensor(dt):
 
 @pytest.mark.parametrize('dt', _TI_TYPES)
 @ti.archs_excluding(ti.opengl)
-def test_type_tensor(dt):
-    _test_type_tensor(dt)
+def test_type_field(dt):
+    _test_type_field(dt)
 
 
 @pytest.mark.parametrize('dt', _TI_64_TYPES)
 @ti.require(ti.extension.data64)
 @ti.archs_excluding(ti.opengl)
-def test_type_tensor64(dt):
-    _test_type_tensor(dt)
+def test_type_field64(dt):
+    _test_type_field(dt)
 
 
 def _test_overflow(dt, n):
-    a = ti.var(dt, shape=())
-    b = ti.var(dt, shape=())
-    c = ti.var(dt, shape=())
+    a = ti.field(dt, shape=())
+    b = ti.field(dt, shape=())
+    c = ti.field(dt, shape=())
 
     @ti.kernel
     def func():

@@ -3,8 +3,7 @@ import taichi as ti
 
 @ti.all_archs
 def test_fill_scalar():
-    val = ti.var(ti.i32)
-
+    val = ti.field(ti.i32)
     n = 4
     m = 7
 
@@ -23,7 +22,7 @@ def test_fill_scalar():
 
 @ti.all_archs
 def test_fill_matrix_scalar():
-    val = ti.Matrix(2, 3, ti.i32)
+    val = ti.Matrix.field(2, 3, ti.i32)
 
     n = 4
     m = 7
@@ -47,7 +46,7 @@ def test_fill_matrix_scalar():
 
 @ti.all_archs
 def test_fill_matrix_matrix():
-    val = ti.Matrix(2, 3, ti.i32)
+    val = ti.Matrix.field(2, 3, ti.i32)
 
     n = 4
     m = 7

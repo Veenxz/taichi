@@ -1,9 +1,10 @@
+import pytest
 import taichi as ti
 from taichi import approx
+import os
 
 
-@ti.all_archs
-def test_mpm88():
+def run_mpm88_test():
     dim = 2
     N = 64
     n_particles = N * N
@@ -16,12 +17,12 @@ def test_mpm88():
     p_mass = p_vol * p_rho
     E = 400
 
-    x = ti.Vector(dim, dt=ti.f32, shape=n_particles)
-    v = ti.Vector(dim, dt=ti.f32, shape=n_particles)
-    C = ti.Matrix(dim, dim, dt=ti.f32, shape=n_particles)
-    J = ti.var(dt=ti.f32, shape=n_particles)
-    grid_v = ti.Vector(dim, dt=ti.f32, shape=(n_grid, n_grid))
-    grid_m = ti.var(dt=ti.f32, shape=(n_grid, n_grid))
+    x = ti.Vector.field(dim, dtype=ti.f32, shape=n_particles)
+    v = ti.Vector.field(dim, dtype=ti.f32, shape=n_particles)
+    C = ti.Matrix.field(dim, dim, dtype=ti.f32, shape=n_particles)
+    J = ti.field(dtype=ti.f32, shape=n_particles)
+    grid_v = ti.Vector.field(dim, dtype=ti.f32, shape=(n_grid, n_grid))
+    grid_m = ti.field(dtype=ti.f32, shape=(n_grid, n_grid))
 
     @ti.kernel
     def substep():
@@ -99,9 +100,23 @@ def test_mpm88():
     ]
     for i in range(4):
         assert (pos**(i + 1)).mean() == approx(regression[i], rel=1e-2)
-    '''
-  canvas.clear(0x112F41)
-  for i in range(n_particles):
-    canvas.circle(ti.vec(pos[i, 0], pos[i, 1])).radius(1.5).color(0x068587).finish()
-  gui.update()
-  '''
+
+
+@ti.all_archs
+def test_mpm88():
+    run_mpm88_test()
+
+
+def _is_appveyor():
+    # AppVeyor adds `APPVEYOR=True` ('true' on Ubuntu)
+    # https://www.appveyor.com/docs/environment-variables/
+    return os.getenv('APPVEYOR', '').lower() == 'true'
+
+
+@pytest.mark.skipif(_is_appveyor(), reason='Stuck on Appveyor.')
+@ti.test(require=ti.extension.async_mode, async_mode=True)
+def test_mpm88_async():
+    # It seems that all async tests on Appveyor run super slow. For example,
+    # on Appveyor, 10+ tests have passed during the execution of
+    # test_fuse_dense_x2y2z. Maybe thread synchronizations are expensive?
+    run_mpm88_test()

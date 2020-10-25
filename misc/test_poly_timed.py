@@ -12,12 +12,10 @@ def grad_test(tifunc, npfunc=None, default_fp=ti.f32):
     @ti.all_archs_with(default_fp=default_fp)
     def impl():
         print(f'arch={ti.cfg.arch} default_fp={ti.cfg.default_fp}')
-        x = ti.var(default_fp)
-        y = ti.var(default_fp)
+        x = ti.field(default_fp)
+        y = ti.field(default_fp)
 
-        @ti.layout
-        def place():
-            ti.root.dense(ti.i, 1).place(x, x.grad, y, y.grad)
+        ti.root.dense(ti.i, 1).place(x, x.grad, y, y.grad)
 
         @ti.kernel
         def func():

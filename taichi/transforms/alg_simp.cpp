@@ -1,4 +1,5 @@
 #include "taichi/ir/ir.h"
+#include "taichi/ir/statements.h"
 #include "taichi/ir/transforms.h"
 #include "taichi/ir/visitors.h"
 #include "taichi/program/program.h"
@@ -9,10 +10,10 @@ TLANG_NAMESPACE_BEGIN
 class AlgSimp : public BasicStmtVisitor {
  private:
   void cast_to_result_type(Stmt *&a, Stmt *stmt) {
-    if (stmt->ret_type.data_type != a->ret_type.data_type) {
+    if (stmt->ret_type != a->ret_type) {
       auto cast = Stmt::make_typed<UnaryOpStmt>(UnaryOpType::cast_value, a);
-      cast->cast_type = stmt->ret_type.data_type;
-      cast->ret_type.data_type = stmt->ret_type.data_type;
+      cast->cast_type = stmt->ret_type;
+      cast->ret_type = stmt->ret_type;
       a = cast.get();
       modifier.insert_before(stmt, std::move(cast));
     }
@@ -26,6 +27,13 @@ class AlgSimp : public BasicStmtVisitor {
 
   explicit AlgSimp(bool fast_math_)
       : BasicStmtVisitor(), fast_math(fast_math_) {
+  }
+
+  void visit(UnaryOpStmt *stmt) override {
+    if (stmt->is_cast() && stmt->cast_type == stmt->operand->ret_type) {
+      stmt->replace_with(stmt->operand);
+      modifier.erase(stmt);
+    }
   }
 
   void visit(BinaryOpStmt *stmt) override {
@@ -59,21 +67,19 @@ class AlgSimp : public BasicStmtVisitor {
         // 1 * a -> a
         stmt->replace_with(stmt->rhs);
         modifier.erase(stmt);
-      } else if ((fast_math || is_integral(stmt->ret_type.data_type)) &&
+      } else if ((fast_math || is_integral(stmt->ret_type)) &&
                  stmt->op_type == BinaryOpType::mul &&
                  (alg_is_zero(lhs) || alg_is_zero(rhs))) {
         // fast_math or integral operands: 0 * a -> 0, a * 0 -> 0
-        if (alg_is_zero(lhs) &&
-            lhs->ret_type.data_type == stmt->ret_type.data_type) {
+        if (alg_is_zero(lhs) && lhs->ret_type == stmt->ret_type) {
           stmt->replace_with(stmt->lhs);
           modifier.erase(stmt);
-        } else if (alg_is_zero(rhs) &&
-                   rhs->ret_type.data_type == stmt->ret_type.data_type) {
+        } else if (alg_is_zero(rhs) && rhs->ret_type == stmt->ret_type) {
           stmt->replace_with(stmt->rhs);
           modifier.erase(stmt);
         } else {
           auto zero = Stmt::make<ConstStmt>(
-              LaneAttribute<TypedConstant>(stmt->ret_type.data_type));
+              LaneAttribute<TypedConstant>(stmt->ret_type));
           stmt->replace_with(zero.get());
           modifier.insert_before(stmt, std::move(zero));
           modifier.erase(stmt);
@@ -86,22 +92,22 @@ class AlgSimp : public BasicStmtVisitor {
           a = stmt->rhs;
         cast_to_result_type(a, stmt);
         auto sum = Stmt::make<BinaryOpStmt>(BinaryOpType::add, a, a);
-        sum->ret_type.data_type = a->ret_type.data_type;
+        sum->ret_type = a->ret_type;
         stmt->replace_with(sum.get());
         modifier.insert_before(stmt, std::move(sum));
         modifier.erase(stmt);
       } else if (fast_math && stmt->op_type == BinaryOpType::div && rhs &&
-                 is_real(rhs->ret_type.data_type)) {
+                 is_real(rhs->ret_type)) {
         if (alg_is_zero(rhs)) {
           TI_WARN("Potential division by 0");
         } else {
           // a / const -> a * (1 / const)
           auto reciprocal = Stmt::make_typed<ConstStmt>(
-              LaneAttribute<TypedConstant>(rhs->ret_type.data_type));
-          if (rhs->ret_type.data_type == DataType::f64) {
+              LaneAttribute<TypedConstant>(rhs->ret_type));
+          if (rhs->ret_type->is_primitive(PrimitiveTypeID::f64)) {
             reciprocal->val[0].val_float64() =
                 (float64)1.0 / rhs->val[0].val_float64();
-          } else if (rhs->ret_type.data_type == DataType::f32) {
+          } else if (rhs->ret_type->is_primitive(PrimitiveTypeID::f32)) {
             reciprocal->val[0].val_float32() =
                 (float32)1.0 / rhs->val[0].val_float32();
           } else {
@@ -109,7 +115,7 @@ class AlgSimp : public BasicStmtVisitor {
           }
           auto product = Stmt::make<BinaryOpStmt>(BinaryOpType::mul, stmt->lhs,
                                                   reciprocal.get());
-          product->ret_type.data_type = stmt->ret_type.data_type;
+          product->ret_type = stmt->ret_type;
           stmt->replace_with(product.get());
           modifier.insert_before(stmt, std::move(reciprocal));
           modifier.insert_before(stmt, std::move(product));
@@ -135,7 +141,7 @@ class AlgSimp : public BasicStmtVisitor {
         auto a = stmt->lhs;
         cast_to_result_type(a, stmt);
         auto result = Stmt::make<UnaryOpStmt>(UnaryOpType::sqrt, a);
-        result->ret_type.data_type = a->ret_type.data_type;
+        result->ret_type = a->ret_type;
         stmt->replace_with(result.get());
         modifier.insert_before(stmt, std::move(result));
         modifier.erase(stmt);
@@ -155,7 +161,7 @@ class AlgSimp : public BasicStmtVisitor {
             else {
               auto new_result = Stmt::make<BinaryOpStmt>(BinaryOpType::mul,
                                                          result, a_power_of_2);
-              new_result->ret_type.data_type = a->ret_type.data_type;
+              new_result->ret_type = a->ret_type;
               result = new_result.get();
               modifier.insert_before(stmt, std::move(new_result));
             }
@@ -165,7 +171,7 @@ class AlgSimp : public BasicStmtVisitor {
             break;
           auto new_a_power = Stmt::make<BinaryOpStmt>(
               BinaryOpType::mul, a_power_of_2, a_power_of_2);
-          new_a_power->ret_type.data_type = a->ret_type.data_type;
+          new_a_power->ret_type = a->ret_type;
           a_power_of_2 = new_a_power.get();
           modifier.insert_before(stmt, std::move(new_a_power));
         }
@@ -181,7 +187,7 @@ class AlgSimp : public BasicStmtVisitor {
         auto new_exponent = Stmt::make<UnaryOpStmt>(UnaryOpType::neg, rhs);
         auto a_to_n = Stmt::make<BinaryOpStmt>(BinaryOpType::pow, stmt->lhs,
                                                new_exponent.get());
-        a_to_n->ret_type.data_type = stmt->ret_type.data_type;
+        a_to_n->ret_type = stmt->ret_type;
         auto result =
             Stmt::make<BinaryOpStmt>(BinaryOpType::div, one_raw, a_to_n.get());
         stmt->replace_with(result.get());
@@ -263,9 +269,19 @@ class AlgSimp : public BasicStmtVisitor {
 
 namespace irpass {
 
+namespace hack {
+bool use_fast_math(IRNode *root) {
+  const Kernel *kernel = root->get_kernel();
+  if (!kernel) {
+    return false;
+  }
+  return kernel->program.config.fast_math;
+}
+}  // namespace hack
+
 bool alg_simp(IRNode *root) {
-  const auto &config = root->get_kernel()->program.config;
-  return AlgSimp::run(root, config.fast_math);
+  TI_AUTO_PROF;
+  return AlgSimp::run(root, hack::use_fast_math(root));
 }
 
 }  // namespace irpass

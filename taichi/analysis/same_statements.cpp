@@ -1,5 +1,6 @@
 #include "taichi/ir/ir.h"
 #include "taichi/ir/analysis.h"
+#include "taichi/ir/statements.h"
 #include "taichi/ir/visitors.h"
 #include <unordered_map>
 #include <unordered_set>
@@ -199,7 +200,25 @@ class IRNodeComparator : public IRVisitor {
 
 namespace irpass::analysis {
 bool same_statements(IRNode *root1, IRNode *root2) {
+  if (root1 == root2)
+    return true;
+  if (!root1 || !root2)
+    return false;
   return IRNodeComparator::run(root1, root2);
+}
+bool same_value(Stmt *stmt1, Stmt *stmt2) {
+  // Test if two statements must have the same value.
+  if (stmt1 == stmt2)
+    return true;
+  if (!stmt1 || !stmt2)
+    return false;
+  // If two identical statements can have different values, return false.
+  if (!stmt1->common_statement_eliminable())
+    return false;
+  // Note that we do not need to test !stmt2->common_statement_eliminable()
+  // because if this condition does not hold,
+  // same_statements(stmt1, stmt2) returns false anyway.
+  return same_statements(stmt1, stmt2);
 }
 }  // namespace irpass::analysis
 
